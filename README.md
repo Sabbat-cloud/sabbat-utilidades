@@ -1,8 +1,8 @@
-# 🕵️‍♂️ `muestra` - Inspector de Archivos Inteligente
+# 🕵️‍♂️ `sabbat-muestra` - Inspector de Archivos Inteligente
 
 > **"No todos los archivos son lo que parecen. `muestra` te lo revela."**
 
-`muestra` es una herramienta de línea de comandos avanzada para inspeccionar archivos con enfoque en **seguridad, metadatos e integridad**. Combina las funcionalidades de `ls`, `file`, `stat`, `sha256sum` y mucho más, con análisis forense básico integrado.
+`sabbat-muestra` es una herramienta de línea de comandos avanzada para inspeccionar archivos con enfoque en **seguridad, metadatos e integridad**. Combina las funcionalidades de `ls`, `file`, `stat`, `sha256sum` y mucho más, con análisis forense básico integrado.
 
 ##  Características
 
@@ -20,12 +20,12 @@
 
 ```bash
 # Clona el repositorio
-git clone https://github.com/tu-usuario/muestra.git
-cd muestra
+git clone https://github.com/sababt-cloud/sabbat-utilidades.git
+cd sabbat-utilidades
 
 # Hazlo ejecutable y enlázalo en tu PATH
-sudo cp muestra /usr/local/bin/
-sudo chmod +x /usr/local/bin/muestra
+sudo cp sabbat-muestra /usr/local/bin/
+sudo chmod +x /usr/local/bin/sabbat-muestra
 
 # Opcional: instala dependencias para funcionalidades avanzadas
 pip3 install chardet Pillow  # Para análisis de encoding e imágenes
