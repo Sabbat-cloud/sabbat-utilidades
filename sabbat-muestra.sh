@@ -8,6 +8,8 @@ import subprocess
 import stat
 import math
 import hashlib
+import json
+import re
 from pathlib import Path
 from datetime import datetime
 import pwd
@@ -29,25 +31,56 @@ except ImportError:
 
 # --- FUNCIONES ---
 
-def analizar_riesgos_seguridad(file_path, file_stats):
+def analizar_riesgos_seguridad(file_path, file_stats, is_symlink=False):
     """Analiza permisos y características de riesgo."""
     alertas = []
     mode = file_stats.st_mode
 
-    if mode & stat.S_ISUID:
-        alertas.append("⚠️  **SUID bit** - Riesgo elevado si no es necesario")
-    if mode & stat.S_ISGID:
-        alertas.append("⚠️  **SGID bit** - Riesgo potencial")
-    if (mode & 0o777) == 0o777:
-        alertas.append("🚨 **PERMISOS 777** - EXTREMADAMENTE PELIGROSO")
-    elif (mode & stat.S_IWOTH):
-        alertas.append("🔓 Archivo escribible por otros usuarios (World-writable)")
+    if not is_symlink:  # Los symlinks no tienen SUID/SGID en la mayoría de sistemas
+        if mode & stat.S_ISUID:
+            alertas.append("⚠️  **SUID bit** - Riesgo elevado si no es necesario")
+        if mode & stat.S_ISGID:
+            alertas.append("⚠️  **SGID bit** - Riesgo potencial")
+        if (mode & 0o777) == 0o777:
+            alertas.append("🚨 **PERMISOS 777** - EXTREMADAMENTE PELIGROSO")
+        elif (mode & stat.S_IWOTH):
+            alertas.append("🔓 Archivo escribible por otros usuarios (World-writable)")
 
-    nombres_riesgo = ['.ssh', '.pem', 'id_rsa', 'password', 'secret', '.env']
-    if any(riesgo in str(file_path).lower() for riesgo in nombres_riesgo):
+    # Nombres sensibles
+    nombres_riesgo = ['.ssh', '.pem', 'id_rsa', 'password', 'secret', '.env', '.bak', '.tmp', '~']
+    path_str = str(file_path).lower()
+    if any(riesgo in path_str for riesgo in nombres_riesgo):
         alertas.append("🔍 Archivo con nombre potencialmente sensible")
 
     return alertas
+
+def detectar_secretos_en_texto(file_path, max_size=1024*1024):
+    """Detecta patrones de secretos en archivos de texto pequeños."""
+    if file_path.stat().st_size > max_size:
+        return []
+
+    secretos = []
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            contenido = f.read(10000)  # Solo primeros 10KB para rendimiento
+    except Exception:
+        return []
+
+    # Patrones comunes (case-insensitive)
+    patrones = [
+        (r'password\s*[:=]\s*["\'][^"\']+', "Contraseña en texto claro"),
+        (r'api[_-]?key\s*[:=]\s*["\'][^"\']+', "Clave de API"),
+        (r'secret\s*[:=]\s*["\'][^"\']+', "Secreto genérico"),
+        (r'-----BEGIN [A-Z ]+PRIVATE KEY-----', "Clave privada"),
+        (r'aws[_-]?access[_-]?key[_-]?id\s*[:=]\s*["\'][A-Z0-9]{20}', "AWS Access Key"),
+        (r'[\d]{4}[\s-]?[\d]{4}[\s-]?[\d]{4}[\s-]?[\d]{4}', "Posible número de tarjeta"),
+    ]
+
+    for patron, descripcion in patrones:
+        if re.search(patron, contenido, re.IGNORECASE | re.MULTILINE):
+            secretos.append(f"🔑 {descripcion}")
+
+    return secretos
 
 def calcular_hashes(file_path, all_hashes=False):
     """Calcula hashes. SHA256 por defecto, o todos si se especifica."""
@@ -56,11 +89,13 @@ def calcular_hashes(file_path, all_hashes=False):
 
     for algo in algorithms:
         hasher = hashlib.new(algo)
-        with open(file_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hasher.update(chunk)
-        hashes[algo] = hasher.hexdigest()
-
+        try:
+            with open(file_path, 'rb') as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hasher.update(chunk)
+            hashes[algo] = hasher.hexdigest()
+        except (OSError, IOError):
+            hashes[algo] = "ERROR (no se pudo leer)"
     return hashes
 
 def format_permissions(mode):
@@ -94,52 +129,93 @@ def format_permissions(mode):
         perms.append('x' if mode & stat.S_IXOTH else '-')
     return "".join(perms)
 
-def get_file_info(file_path_str):
+def get_file_info(file_path_str, follow_symlinks=True):
     """Obtiene información detallada, incluyendo alertas de seguridad."""
     file_path = Path(file_path_str)
 
     if not file_path.exists():
         raise FileNotFoundError(f"El fichero '{file_path}' no existe.")
-    try:
-        tipo_mime = subprocess.run(
-            ["file", "--mime-type", "-b", str(file_path)],
-            capture_output=True, text=True, check=True
-        ).stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        tipo_mime = "application/octet-stream"
 
-    file_stats = file_path.stat()
+    # Manejo de symlinks
+    is_symlink = file_path.is_symlink()
+    if is_symlink and not follow_symlinks:
+        # Analizamos el symlink mismo, no su destino
+        resolved_path = None
+        try:
+            resolved_path = os.readlink(file_path)
+        except OSError:
+            resolved_path = "ERROR (enlace roto)"
+        tipo_mime = "inode/symlink"
+        file_stats = file_path.lstat()  # lstat para no seguir el enlace
+    else:
+        # Seguimos el enlace (comportamiento por defecto)
+        resolved_path = None
+        try:
+            tipo_mime = subprocess.run(
+                ["file", "--mime-type", "-b", str(file_path)],
+                capture_output=True, text=True, check=True
+            ).stdout.strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            tipo_mime = "application/octet-stream"
+        file_stats = file_path.stat()
+
     permissions = format_permissions(file_stats.st_mode)
-    owner = pwd.getpwuid(file_stats.st_uid).pw_name
-    group = grp.getgrgid(file_stats.st_gid).gr_name
+    try:
+        owner = pwd.getpwuid(file_stats.st_uid).pw_name
+    except KeyError:
+        owner = str(file_stats.st_uid)
+    try:
+        group = grp.getgrgid(file_stats.st_gid).gr_name
+    except KeyError:
+        group = str(file_stats.st_gid)
+
     size_bytes = file_stats.st_size
     mod_time = datetime.fromtimestamp(file_stats.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
     acc_time = datetime.fromtimestamp(file_stats.st_atime).strftime('%Y-%m-%d %H:%M:%S')
     cre_time = datetime.fromtimestamp(file_stats.st_ctime).strftime('%Y-%m-%d %H:%M:%S')
 
     info = {
-        'nombre': str(file_path), 'tipo_mime': tipo_mime, 'tamaño_bytes': size_bytes,
-        'permisos': permissions, 'propietario': f"{owner}:{group}", 'fecha_mod': mod_time,
-        'fecha_acc': acc_time, 'fecha_cre': cre_time, 'inodo': file_stats.st_ino,
+        'nombre': str(file_path),
+        'tipo_mime': tipo_mime,
+        'tamaño_bytes': size_bytes,
+        'permisos': permissions,
+        'propietario': f"{owner}:{group}",
+        'fecha_mod': mod_time,
+        'fecha_acc': acc_time,
+        'fecha_cre': cre_time,
+        'inodo': file_stats.st_ino,
+        'es_symlink': is_symlink,
+        'destino_symlink': resolved_path,
         'detalles_contextuales': [],
-        'alertas_seguridad': analizar_riesgos_seguridad(file_path, file_stats)
+        'alertas_seguridad': analizar_riesgos_seguridad(file_path, file_stats, is_symlink)
     }
 
-    if tipo_mime.startswith('text/'):
+    # Análisis contextual según tipo
+    if is_symlink and not follow_symlinks:
+        info['detalles_contextuales'].append(f"Enlace simbólico a: {resolved_path}")
+    elif tipo_mime.startswith('text/'):
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 num_lineas = sum(1 for _ in f)
             info['detalles_contextuales'].append(f"{num_lineas} líneas")
         except Exception:
             info['detalles_contextuales'].append("No se pudo contar las líneas")
+        
+        # Detección de secretos
+        secretos = detectar_secretos_en_texto(file_path)
+        info['alertas_seguridad'].extend(secretos)
+
         if CHARDET_AVAILABLE:
-            with open(file_path, 'rb') as f:
-                raw_data = f.read(1024)
-                result = chardet.detect(raw_data)
-                encoding = result['encoding']
-                confidence = result['confidence'] * 100
-                if encoding:
-                    info['detalles_contextuales'].append(f"Encoding: {encoding} ({confidence:.1f}% conf.)")
+            try:
+                with open(file_path, 'rb') as f:
+                    raw_data = f.read(1024)
+                    result = chardet.detect(raw_data)
+                    encoding = result['encoding']
+                    confidence = result['confidence'] * 100
+                    if encoding and confidence > 50:
+                        info['detalles_contextuales'].append(f"Encoding: {encoding} ({confidence:.1f}% conf.)")
+            except Exception:
+                pass
     elif tipo_mime.startswith('image/'):
         if PILLOW_AVAILABLE:
             try:
@@ -173,6 +249,7 @@ def get_file_info(file_path_str):
                 info['detalles_contextuales'].append(f"Compilador: GCC {version_info}")
         except Exception:
             pass
+
     return info
 
 def format_size(bytes_size, option="auto"):
@@ -201,6 +278,8 @@ Opciones de tamaño:
 Otras opciones:
       --hashes     Calcular y mostrar todos los hashes (MD5, SHA1, SHA256).
                    Por defecto, solo se muestra SHA256.
+      --nofollow   No seguir enlaces simbólicos (analiza el enlace mismo).
+      --json       Salida en formato JSON (ideal para scripts).
   -h, --help       Mostrar esta ayuda.
 """
     print(help_text)
@@ -217,11 +296,14 @@ def main():
     size_group.add_argument("-g", "--gb", action="store_true")
 
     parser.add_argument("--hashes", action="store_true", help="Calcular y mostrar todos los hashes.")
+    parser.add_argument("--nofollow", action="store_true", help="No seguir enlaces simbólicos.")
+    parser.add_argument("--json", action="store_true", help="Salida en formato JSON.")
     parser.add_argument("fichero", nargs='?')
     args = parser.parse_args()
 
     if args.help or not args.fichero:
-        show_help(nombre_script)
+        if not args.json:
+            show_help(nombre_script)
         sys.exit(0)
 
     size_option = "auto"
@@ -231,41 +313,77 @@ def main():
     elif args.gb: size_option = "gb"
 
     try:
-        info = get_file_info(args.fichero)
+        info = get_file_info(args.fichero, follow_symlinks=not args.nofollow)
         info_tamaño = format_size(info['tamaño_bytes'], size_option)
         hashes = calcular_hashes(args.fichero, all_hashes=args.hashes)
 
-        print(f"\033[1;36mFichero:\033[0m       {info['nombre']}")
-        print(f"\033[1;36mTipo MIME:\033[0m     {info['tipo_mime']}")
-        print(f"\03Tño:\033[0m        {info_tamaño}")
-        print("-" * 40)
-        print(f"\033[1;36mPermisos:\033[0m      {info['permisos']} (Inodo: {info['inodo']})")
-        print(f"\033[1;36mPropietario:\033[0m   {info['propietario']}")
+        # Añadir hashes al info
+        info['hashes'] = hashes
+        info['tamaño_formateado'] = info_tamaño
 
-        if info['alertas_seguridad']:
-            print("\033[1;33mAlertas Seg.:\033[0m")
-            for alerta in info['alertas_seguridad']:
-                print(f"               {alerta}")
-
-        print("-" * 40)
-        print(f"\033[1;36mModificado:\033[0m    {info['fecha_mod']}")
-        print(f"\033[1;36mAccedido:\033[0m      {info['fecha_acc']}")
-
-        if info['detalles_contextuales']:
+        if args.json:
+            # Preparar para JSON: quitar objetos no serializables
+            json_output = {
+                'nombre': info['nombre'],
+                'tipo_mime': info['tipo_mime'],
+                'tamaño_bytes': info['tamaño_bytes'],
+                'tamaño_formateado': info['tamaño_formateado'],
+                'permisos': info['permisos'],
+                'propietario': info['propietario'],
+                'inodo': info['inodo'],
+                'es_symlink': info['es_symlink'],
+                'destino_symlink': info['destino_symlink'],
+                'fechas': {
+                    'modificacion': info['fecha_mod'],
+                    'acceso': info['fecha_acc'],
+                    'cambio_metadatos': info['fecha_cre']
+                },
+                'detalles_contextuales': info['detalles_contextuales'],
+                'alertas_seguridad': info['alertas_seguridad'],
+                'hashes': info['hashes']
+            }
+            print(json.dumps(json_output, indent=2, ensure_ascii=False))
+        else:
+            # Salida humana
+            print(f"\033[1;36mFichero:\033[0m       {info['nombre']}")
+            if info['es_symlink'] and not args.nofollow:
+                print(f"\033[1;36mDestino:\033[0m       {info['destino_symlink']}")
+            print(f"\033[1;36mTipo MIME:\033[0m     {info['tipo_mime']}")
+            print(f"\033[1;36mTamaño:\033[0m        {info_tamaño}")
             print("-" * 40)
-            for detalle in info['detalles_contextuales']:
-                print(f"\033[1;32m→\033[0m {detalle}")
+            print(f"\033[1;36mPermisos:\033[0m      {info['permisos']} (Inodo: {info['inodo']})")
+            print(f"\033[1;36mPropietario:\033[0m   {info['propietario']}")
 
-        print("-" * 40)
-        print("\033[1;36mIntegridad:\033[0m")
-        for algo, h in hashes.items():
-            print(f"  {algo.upper()}: {h}")
+            if info['alertas_seguridad']:
+                print("\033[1;33mAlertas Seg.:\033[0m")
+                for alerta in info['alertas_seguridad']:
+                    print(f"               {alerta}")
+
+            print("-" * 40)
+            print(f"\033[1;36mModificado:\033[0m    {info['fecha_mod']}")
+            print(f"\033[1;36mAccedido:\033[0m      {info['fecha_acc']}")
+
+            if info['detalles_contextuales']:
+                print("-" * 40)
+                for detalle in info['detalles_contextuales']:
+                    print(f"\033[1;32m→\033[0m {detalle}")
+
+            print("-" * 40)
+            print("\033[1;36mIntegridad:\033[0m")
+            for algo, h in hashes.items():
+                print(f"  {algo.upper()}: {h}")
 
     except FileNotFoundError as e:
-        print(f"\033[1;31mError: {e}\033[0m", file=sys.stderr)
+        if args.json:
+            print(json.dumps({"error": str(e)}, indent=2))
+        else:
+            print(f"\033[1;31mError: {e}\033[0m", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        print(f"\033[1;31mError inesperado: {e}\033[0m", file=sys.stderr)
+        if args.json:
+            print(json.dumps({"error": f"Error inesperado: {str(e)}"}, indent=2))
+        else:
+            print(f"\033[1;31mError inesperado: {e}\033[0m", file=sys.stderr)
         sys.exit(1)
 
 if __name__ == "__main__":
