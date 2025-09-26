@@ -69,7 +69,7 @@ def detectar_secretos_en_texto(file_path, max_size=1024*1024):
     # Patrones comunes (case-insensitive)
     patrones = [
         (r'password\s*[:=]\s*["\'][^"\']+', "Contraseña en texto claro"),
-        (r'api[_-]?key\s*[:=]\s*["\'][^"\']+', "Clave de API"),
+        (r'api[_-]?key\s*[:=]\s*["\']?([A-Za-z0-9_\-]{20,})["\']?', "Clave de API"),
         (r'secret\s*[:=]\s*["\'][^"\']+', "Secreto genérico"),
         (r'-----BEGIN [A-Z ]+PRIVATE KEY-----', "Clave privada"),
         (r'aws[_-]?access[_-]?key[_-]?id\s*[:=]\s*["\'][A-Z0-9]{20}', "AWS Access Key"),
