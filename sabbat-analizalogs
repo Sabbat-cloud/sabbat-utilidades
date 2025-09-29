@@ -81,21 +81,25 @@ class AnalizadorLogs:
             logging.error(f"Error abriendo archivo: {e}")
             raise
     def extraer_ips_validas(self, linea):
-        """Extrae y valida direcciones IPv4 e IPv6 de una línea."""
         ips_validas = []
-        # Patrón para IPv4 (más estricto)
-        ipv4_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
-        # Patrón para IPv6 (soporta varias formas)
-        ipv6_pattern = r'(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:)*::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:)+:|::1|::ffff:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
-        # Buscar todas las candidatas
-        candidatas = re.findall(ipv4_pattern, linea) + re.findall(ipv6_pattern, linea)
-        for ip_str in candidatas:
+        # Dividir la línea por espacios y otros separadores para obtener "palabras" candidatas.
+        # Este método es más simple y robusto que una regex compleja para IPs.
+        posibles_ips = re.split(r'[\s,;\'"()\[\]]+', linea)
+
+        for candidato in posibles_ips:
+            if not candidato:
+                continue
             try:
-                ip_obj = ipaddress.ip_address(ip_str)
+                # Intenta interpretar el candidato como una dirección IP (v4 o v6)
+                ip_obj = ipaddress.ip_address(candidato)
+                # Si tiene éxito, comprueba que no sea privada ni de loopback
                 if not (ip_obj.is_private or ip_obj.is_loopback):
                     ips_validas.append(str(ip_obj))
+
             except ValueError:
+                # Si no es una IP válida, ipaddress.ip_address falla y simplemente la ignoramos.
                 continue
+
         return ips_validas
 
     def analizar(self, patron=None, contar=10, since=None, until=None, output_file=None):
