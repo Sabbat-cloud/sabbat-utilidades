@@ -80,17 +80,18 @@ class AnalizadorLogs:
         except Exception as e:
             logging.error(f"Error abriendo archivo: {e}")
             raise
-
     def extraer_ips_validas(self, linea):
         """Extrae y valida direcciones IPv4 e IPv6 de una línea."""
         ips_validas = []
-        # Usa una regex más general y deja que el módulo 'ipaddress' valide
-        candidatos = re.split(r'[\s,;\'"()\[\]]+', linea)
-        for candidato in candidatos:
-            if not candidato:
-                continue
+        # Patrón para IPv4 (más estricto)
+        ipv4_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+        # Patrón para IPv6 (soporta varias formas)
+        ipv6_pattern = r'(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:)*::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:)+:|::1|::ffff:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
+        # Buscar todas las candidatas
+        candidatas = re.findall(ipv4_pattern, linea) + re.findall(ipv6_pattern, linea)
+        for ip_str in candidatas:
             try:
-                ip_obj = ipaddress.ip_address(candidato)
+                ip_obj = ipaddress.ip_address(ip_str)
                 if not (ip_obj.is_private or ip_obj.is_loopback):
                     ips_validas.append(str(ip_obj))
             except ValueError:
