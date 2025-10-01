@@ -11,6 +11,7 @@ import logging
 from collections import Counter
 from datetime import datetime
 import os
+from itertools import zip_longest
 
 # Ruta a la base de datos GeoIP.
 GEOIP_DB_PATH = "/var/lib/GeoIP/GeoLite2-Country.mmdb"
@@ -22,87 +23,117 @@ try:
 except ImportError:
     geoip2 = None
 
+
 def should_use_color():
-    """Devuelve True si la salida es una terminal (para usar colores ANSI)."""
-    return sys.stdout.isatty()
+    """Devuelve True si la salida es una terminal (para usar colores ANSI) y NO_COLOR no está definido."""
+    return sys.stdout.isatty() and not os.getenv("NO_COLOR")
+
 
 class AnalizadorLogs:
-    def __init__(self, archivo_log, json_output=False, geoip_db_path=None, max_ips=None, max_errors=None, verbose=False):
+    def __init__(
+        self,
+        archivo_log,
+        json_output=False,
+        geoip_db_path=None,
+        max_ips=None,
+        max_errors=None,
+        verbose=False,
+        list_view=False,
+    ):
         self.archivo_log = archivo_log
         self.json_output = json_output
         self.max_ips = max_ips
         self.max_errors = max_errors
         self.geoip_db_path = geoip_db_path or GEOIP_DB_PATH
+        self.list_view = list_view  # Preferencia de vista
 
-        self.setup_logging(verbose)
+        self._init_logger(verbose)
         self.geoip_cache = {}
+        self.patrones_sospechosos = {
+            "sql_injection": re.compile(
+                r"(?i)(?:\bUNION\b.+\bSELECT\b|\bSELECT\b|\bINSERT\b|\bDROP\b|\bDELETE\b|%27|--\s|/\*|\bSLEEP\(|INFORMATION_SCHEMA)"
+            ),
+            "path_traversal": re.compile(r"(\.\./|\.\.\\|%2e%2e/)", re.IGNORECASE),
+            "xss_attempt": re.compile(r"(?i)(?:<script\b|javascript:|on\w+=)")
+        }
 
-        # Patrones mejorados, incluyendo ambos formatos de timestamp
         self.patrones = {
-            'error': r'\b(ERROR|Error|error|ERR|Fail|FAIL|fail|Exception|EXCEPTION|CRITICAL|Critical)\b',
-            'warning': r'\b(WARNING|Warning|warning|WARN|Warn|warn)\b',
-            'http_full': re.compile(r'"(\b(?:GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|CONNECT|TRACE)\b)\s+([^\s]+)\s+[^"]+"\s+(\d{3})'),
-            'user_agent': re.compile(r'"[^"]*"[^"]*"[^"]*"([^"]*)"'),
-            'timestamp_iso': r'\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?',
-            'timestamp_apache': r'\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4}'
+            "error": r"\b(ERROR|Error|error|ERR|Fail|FAIL|fail|Exception|EXCEPTION|CRITICAL|Critical)\b",
+            "warning": r"\b(WARNING|Warning|warning|WARN|Warn|warn)\b",
+            # Método, URL, Código
+            "http_full": re.compile(
+                r'"(\b(?:GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|CONNECT|TRACE)\b)\s+([^\s]+)\s+[^"]+"\s+(\d{3})'
+            ),
+            # Heurística legacy (fallback) para UA
+            "user_agent": re.compile(r'"([^"]*(?:Mozilla|curl|Python|Wget|bot)[^"]*)"', re.IGNORECASE),
+            # UA como último campo entre comillas (combined/nginx habitual)
+            "user_agent_tail": re.compile(r'"[^"]*"\s+"([^"]*)"\s*$'),
+            "timestamp_iso": r"\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?",
+            "timestamp_apache": r"\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4}",
         }
 
         self.geoip_reader = self._cargar_geoip()
 
+    def _init_logger(self, verbose=False):
+        self.logger = logging.getLogger("analizador_logs")
+        self.logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+        if not self.logger.handlers:
+            h = logging.StreamHandler(sys.stderr)
+            h.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+            self.logger.addHandler(h)
+
     def _cargar_geoip(self):
-        """Carga la base de datos GeoIP y maneja los errores."""
         if not geoip2:
-            logging.warning("Módulo geoip2 no instalado. La geolocalización estará desactivada.")
+            self.logger.warning(
+                "Módulo geoip2 no instalado. La geolocalización estará desactivada."
+            )
             return None
         try:
             reader = geoip2.database.Reader(self.geoip_db_path)
-            logging.info(f"Base de datos GeoIP cargada desde {self.geoip_db_path}")
+            self.logger.info(f"Base de datos GeoIP cargada desde {self.geoip_db_path}")
             return reader
         except FileNotFoundError:
             msg = f"Advertencia: No se encontró la base de datos GeoIP en {self.geoip_db_path}."
             if not self.json_output:
                 print(f"\033[1;33m{msg}\033[0m" if should_use_color() else msg)
-            logging.warning(msg)
+            self.logger.warning(msg)
         except Exception as e:
-            logging.error(f"Error cargando GeoIP: {e}")
+            self.logger.error(f"Error cargando GeoIP: {e}")
         return None
-
-    def setup_logging(self, verbose=False):
-        level = logging.DEBUG if verbose else logging.INFO
-        logging.basicConfig(level=level, format='%(asctime)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler(sys.stderr)])
 
     def abrir_archivo(self):
         try:
-            if self.archivo_log.endswith('.gz'):
-                return gzip.open(self.archivo_log, 'rt', encoding='utf-8', errors='ignore')
+            if self.archivo_log == "-":
+                # Permitir stdin en pipelines
+                return sys.stdin
+            if self.archivo_log.endswith(".gz"):
+                return gzip.open(
+                    self.archivo_log, "rt", encoding="utf-8", errors="ignore"
+                )
             else:
-                return open(self.archivo_log, 'r', encoding='utf-8', errors='ignore')
+                return open(self.archivo_log, "r", encoding="utf-8", errors="ignore")
         except Exception as e:
-            logging.error(f"Error abriendo archivo: {e}")
+            self.logger.error(f"Error abriendo archivo: {e}")
             raise
+
     def extraer_ips_validas(self, linea):
         ips_validas = []
-        # Dividir la línea por espacios y otros separadores para obtener "palabras" candidatas.
-        # Este método es más simple y robusto que una regex compleja para IPs.
-        posibles_ips = re.split(r'[\s,;\'"()\[\]]+', linea)
-
+        posibles_ips = re.split(r"[\s,;'\"()\[\]]+", linea)
         for candidato in posibles_ips:
             if not candidato:
                 continue
             try:
-                # Intenta interpretar el candidato como una dirección IP (v4 o v6)
                 ip_obj = ipaddress.ip_address(candidato)
-                # Si tiene éxito, comprueba que no sea privada ni de loopback
-                if not (ip_obj.is_private or ip_obj.is_loopback):
+                # Acepta solo IPs globales (descarta privadas, loopback, multicast, etc.)
+                if getattr(ip_obj, "is_global", False):
                     ips_validas.append(str(ip_obj))
-
             except ValueError:
-                # Si no es una IP válida, ipaddress.ip_address falla y simplemente la ignoramos.
                 continue
-
         return ips_validas
 
-    def analizar(self, patron=None, contar=10, since=None, until=None, output_file=None):
+    def analizar(
+        self, patron=None, contar=10, since=None, until=None, output_file=None
+    ):
         try:
             with self.abrir_archivo() as file_obj:
                 if patron:
@@ -110,7 +141,10 @@ class AnalizadorLogs:
                     if output_file:
                         self._guardar_resultados(resultados, output_file)
                     else:
-                        self._mostrar_busqueda_patron(resultados)
+                        if self.json_output:
+                            print(json.dumps(resultados, indent=2, ensure_ascii=False))
+                        else:
+                            self._mostrar_busqueda_patron(resultados)
                 else:
                     stats = self._generar_estadisticas(file_obj, since, until)
                     if output_file:
@@ -122,125 +156,175 @@ class AnalizadorLogs:
         except FileNotFoundError:
             self._manejar_error({"error": f"Archivo {self.archivo_log} no encontrado"})
         except Exception as e:
-            logging.error(f"Error en análisis: {e}", exc_info=True)
+            self.logger.error("Error en análisis", exc_info=True)
             self._manejar_error({"error": f"Error al analizar el archivo: {e}"})
         finally:
-            if self.geoip_reader:
-                self.geoip_reader.close()
+            try:
+                if self.geoip_reader:
+                    self.geoip_reader.close()
+            except Exception:
+                pass
 
     def _manejar_error(self, error_msg):
         if self.json_output:
-            print(json.dumps(error_msg, indent=4))
+            print(json.dumps(error_msg, indent=4, ensure_ascii=False))
         else:
             msg = f"Error: {error_msg['error']}"
             print(f"\033[1;31m{msg}\033[0m" if should_use_color() else msg)
         sys.exit(1)
 
     def _esta_en_rango_temporal(self, linea, since, until):
-        """Helper mejorado que intenta parsear múltiples formatos de timestamp."""
         if not (since or until):
             return True
-
-        iso_match = re.search(self.patrones['timestamp_iso'], linea)
-        apache_match = re.search(self.patrones['timestamp_apache'], linea)
+        iso_match = re.search(self.patrones["timestamp_iso"], linea)
+        apache_match = re.search(self.patrones["timestamp_apache"], linea)
         log_time = None
-
         try:
             if iso_match:
-                log_time_str = iso_match.group(0).replace('T', ' ').split('.')[0]
-                log_time = datetime.strptime(log_time_str, '%Y-%m-%d %H:%M:%S')
+                log_time_str_full = iso_match.group(0).replace("T", " ")
+                # Quitar fracciones antes de parsear si existen
+                log_time_str = re.sub(r"\.\d+", "", log_time_str_full)
+                # Ignoramos TZ para mantener compatibilidad con filtros naïve
+                log_time = datetime.strptime(log_time_str, "%Y-%m-%d %H:%M:%S")
             elif apache_match:
                 log_time_str = apache_match.group(0)
-                # Parsear con timezone y luego quitarlo para comparar fechas "naive"
-                log_time = datetime.strptime(log_time_str, '%d/%b/%Y:%H:%M:%S %z').replace(tzinfo=None)
+                # Parseamos con TZ y luego lo dejamos naïve para comparar
+                log_time = (
+                    datetime.strptime(log_time_str, "%d/%b/%Y:%H:%M:%S %z").replace(tzinfo=None)
+                )
         except ValueError as e:
-            logging.debug(f"No se pudo parsear el timestamp: {e}")
+            self.logger.debug(f"No se pudo parsear el timestamp: {e}")
             return True
-
         if log_time is None:
             return True
-
-        if since and log_time < since: return False
-        if until and log_time > until: return False
-
+        if since and log_time < since:
+            return False
+        if until and log_time > until:
+            return False
         return True
 
     def _buscar_patron(self, archivo_iterable, patron, contar, since, until):
         regex = re.compile(patron, re.IGNORECASE)
-        coincidencias = []
+        primeros = []
+        total = 0
         for linea in archivo_iterable:
             if not self._esta_en_rango_temporal(linea, since, until):
                 continue
             if regex.search(linea):
-                coincidencias.append(linea.strip())
-        return {'patron': patron, 'coincidencias': coincidencias[:contar], 'total_encontradas': len(coincidencias)}
+                total += 1
+                if len(primeros) < contar:
+                    primeros.append(linea.strip())
+        return {
+            "patron": patron,
+            "coincidencias": primeros,
+            "total_encontradas": total,
+        }
 
     def _mostrar_busqueda_patron(self, resultados):
-        color_prefix, color_reset = ("\033[1;32m", "\033[0m") if should_use_color() else ("", "")
-        print(f"\n{color_prefix}Buscando coincidencias para '{resultados['patron']}':{color_reset}")
-        print(f"Mostrando {len(resultados['coincidencias'])} de {resultados['total_encontradas']} coincidencias:\n")
-        for i, linea in enumerate(resultados['coincidencias'], 1):
+        c_prefix, c_reset = ("\033[1;32m", "\033[0m") if should_use_color() else ("", "")
+        print(f"\n{c_prefix}Buscando coincidencias para '{resultados['patron']}':{c_reset}")
+        print(
+            f"Mostrando {len(resultados['coincidencias'])} de {resultados['total_encontradas']} coincidencias:\n"
+        )
+        for i, linea in enumerate(resultados["coincidencias"], 1):
             print(f"{i}: {linea}")
 
     def _generar_estadisticas(self, archivo_iterable, since=None, until=None):
         stats = Counter()
-        stats['ips'] = Counter()
-        stats['errores_especificos'] = Counter()
-        stats['urls_mas_solicitadas'] = Counter()
-        stats['user_agents'] = Counter()
-        stats['metodos_http'] = Counter()
-        stats['codigos_estado_http'] = Counter()
+        stats.update(
+            {
+                k: Counter()
+                for k in [
+                    "ips",
+                    "errores_especificos",
+                    "urls_mas_solicitadas",
+                    "user_agents",
+                    "metodos_http",
+                    "codigos_estado_http",
+                    "actividad_sospechosa",
+                ]
+            }
+        )
         timestamps = []
         lineas_procesadas = 0
 
-        regex_dict = {key: re.compile(val) for key, val in self.patrones.items() if isinstance(val, str)}
-        regex_dict.update({k: v for k, v in self.patrones.items() if isinstance(v, re.Pattern)})
+        # Compatibilidad con versiones sin re.Pattern
+        PatternT = getattr(re, "Pattern", type(re.compile("")))
+        regex_dict = {k: re.compile(v) for k, v in self.patrones.items() if isinstance(v, str)}
+        regex_dict.update({k: v for k, v in self.patrones.items() if isinstance(v, PatternT)})
 
         for linea in archivo_iterable:
             lineas_procesadas += 1
             if not self._esta_en_rango_temporal(linea, since, until):
                 continue
+            stats["total_lineas"] += 1
 
-            stats['total_lineas'] += 1
+            if regex_dict["error"].search(linea):
+                stats["errores_count"] += 1
+                mensaje = linea.strip().split("]:", 1)[-1].strip()
+                # Normaliza números/ids para agrupar
+                mensaje = re.sub(
+                    r"\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)*|\d{1,3}(?:\.\d{1,3}){3})\b",
+                    "<NUM>",
+                    mensaje,
+                )
+                if self.max_errors is None or len(stats["errores_especificos"]) < self.max_errors:
+                    stats["errores_especificos"][mensaje] += 1
 
-            if regex_dict['error'].search(linea):
-                stats['errores_count'] += 1
-                mensaje = linea.strip().split(']:', 1)[-1].strip()
-                if self.max_errors is None or len(stats['errores_especificos']) < self.max_errors:
-                    stats['errores_especificos'][mensaje] += 1
-
-            if regex_dict['warning'].search(linea):
-                stats['warnings_count'] += 1
+            if regex_dict["warning"].search(linea):
+                stats["warnings_count"] += 1
 
             for ip in self.extraer_ips_validas(linea):
-                if self.max_ips is None or len(stats['ips']) < self.max_ips:
-                    stats['ips'][ip] += 1
+                if self.max_ips is None or len(stats["ips"]) < self.max_ips:
+                    stats["ips"][ip] += 1
 
-            http_match = regex_dict['http_full'].search(linea)
+            http_match = regex_dict["http_full"].search(linea)
             if http_match:
                 metodo, url, codigo = http_match.groups()
-                stats['metodos_http'][metodo] += 1
-                stats['codigos_estado_http'][codigo] += 1
-                stats['urls_mas_solicitadas'][url] += 1
+                stats["metodos_http"][metodo] += 1
+                stats["codigos_estado_http"][codigo] += 1
+                stats["urls_mas_solicitadas"][url] += 1
+                # Heurísticas de seguridad sobre la URL (solo si parece query o contiene encoding)
+                if ("?" in url or "=" in url or "%" in url):
+                    for nombre, patron in self.patrones_sospechosos.items():
+                        if patron.search(url):
+                            stats["actividad_sospechosa"][nombre] += 1
 
-            ua_match = regex_dict['user_agent'].search(linea)
-            if ua_match and (ua := ua_match.group(1).strip()) and ua != '-':
-                stats['user_agents'][ua] += 1
+            # User-Agent: intenta último campo; si no, fallback
+            ua = None
+            ua_tail = regex_dict["user_agent_tail"].search(linea)
+            if ua_tail:
+                ua = ua_tail.group(1).strip()
+            else:
+                ua_match = regex_dict["user_agent"].search(linea)
+                if ua_match:
+                    ua = ua_match.group(1).strip()
+            if ua and ua != "-":
+                stats["user_agents"][ua] += 1
 
-            ts_iso = regex_dict['timestamp_iso'].search(linea)
-            ts_apache = regex_dict['timestamp_apache'].search(linea)
-            if ts_iso: timestamps.append(ts_iso.group(0))
-            elif ts_apache: timestamps.append(ts_apache.group(0))
+            ts_iso = regex_dict["timestamp_iso"].search(linea)
+            ts_apache = regex_dict["timestamp_apache"].search(linea)
+            if ts_iso:
+                timestamps.append(ts_iso.group(0))
+            elif ts_apache:
+                timestamps.append(ts_apache.group(0))
 
-        if self.max_ips is None and self.max_errors is None and lineas_procesadas > 100_000:
-            logging.warning(f"El log es grande ({lineas_procesadas:,} líneas). Considere usar --max-ips o --max-errors.")
-
-        stats['timestamps'] = [timestamps[0], timestamps[-1]] if timestamps else []
+        if (
+            self.max_ips is None
+            and self.max_errors is None
+            and lineas_procesadas > 100_000
+        ):
+            self.logger.warning(
+                f"El log es grande ({lineas_procesadas:,} líneas). Considere usar --max-ips o --max-errors."
+            )
+        stats["timestamps"] = [timestamps[0], timestamps[-1]] if timestamps else []
         return stats
 
     def _get_country_for_ip(self, ip):
-        if ip in self.geoip_cache: return self.geoip_cache[ip]
-        if not self.geoip_reader: return "GeoIP no disponible"
+        if ip in self.geoip_cache:
+            return self.geoip_cache[ip]
+        if not self.geoip_reader:
+            return "GeoIP no disponible"
         try:
             country = self.geoip_reader.country(ip).country.name or "Desconocido"
         except geoip2.errors.AddressNotFoundError:
@@ -254,107 +338,203 @@ class AnalizadorLogs:
         resumen = Counter()
         for code_str, count in http_codes_counter.items():
             try:
-                rango = f"{int(code_str) // 100}xx"
-                resumen[rango] += count
+                resumen[f"{int(code_str) // 100}xx"] += count
             except (ValueError, TypeError):
-                resumen['Otros'] += count
+                resumen["Otros"] += count
         return resumen
 
-    def _truncar_texto(self, texto, longitud=80):
-        return texto[:longitud] + '...' if len(texto) > longitud else texto
+    def _truncar_texto(self, texto, longitud=40):
+        return texto[:longitud] + "..." if len(texto) > longitud else texto
 
-    def _renderizar_texto(self, stats):
+    def _renderizar_texto_columnas(self, stats):
         output = []
         add = output.append
-        c_head, c_sub, c_reset = ("\033[1;34m", "\033[1;36m", "\033[0m") if should_use_color() else ("", "", "")
+        c_head, c_sub, c_reset = (
+            ("\033[1;34m", "\033[1;36m", "\033[0m") if should_use_color() else ("", "", "")
+        )
 
         add(f"\n{c_head}=== ESTADÍSTICAS DEL LOG ==={c_reset}")
+        add(f"Líneas totales: {stats.get('total_lineas', 0):,}")
+        add(
+            f"Errores: {stats.get('errores_count', 0)} | Advertencias: {stats.get('warnings_count', 0)}"
+        )
+        if stats.get("timestamps"):
+            add(f"Periodo: De {stats['timestamps'][0]} a {stats['timestamps'][-1]}")
+
+        if stats.get("actividad_sospechosa"):
+            add(f"\n{c_head}Alertas de Seguridad Detectadas:{c_reset}")
+            alertas = [
+                f"{tipo.replace('_', ' ').title()} ({count})"
+                for tipo, count in stats["actividad_sospechosa"].items()
+            ]
+            add(" | ".join(alertas))
+
+        add(f"\n{'-'*80}")
+
+        col_izquierda, col_derecha = [], []
+
+        col_izquierda.append(f"{c_sub}Códigos de Estado HTTP:{c_reset}")
+        if stats.get("codigos_estado_http"):
+            for code, count in stats["codigos_estado_http"].most_common(5):
+                col_izquierda.append(f"  - Código {code}: {count} veces")
+            resumen = self._agrupar_codigos_http(stats["codigos_estado_http"])
+            col_izquierda.append(f"  {c_sub}Resumen por rangos:{c_reset}")
+            for rango, count in sorted(resumen.items()):
+                col_izquierda.append(f"    - {rango}: {count} peticiones")
+        else:
+            col_izquierda.append("  (Sin datos)")
+
+        if stats.get("urls_mas_solicitadas"):
+            col_izquierda.append("")
+            col_izquierda.append(f"{c_sub}Top 5 URLs Solicitadas:{c_reset}")
+            for url, count in stats["urls_mas_solicitadas"].most_common(5):
+                col_izquierda.append(f"  - ({count}) {self._truncar_texto(url, 35)}")
+
+        if stats.get("ips"):
+            col_derecha.append(f"{c_sub}Top 10 IPs con Geolocalización:{c_reset}")
+            col_derecha.append(f"{'VECES':<7} {'IP':<18} {'PAÍS'}")
+            col_derecha.append(f"{'-----':<7} {'------------------':<18} {'------'}")
+            for ip, count in stats["ips"].most_common(10):
+                country = self._get_country_for_ip(ip)
+                col_derecha.append(
+                    f"{count:<7} {ip:<18} {self._truncar_texto(country, 15)}"
+                )
+        if stats.get("user_agents"):
+            col_derecha.append("")
+            col_derecha.append(f"{c_sub}Top 5 User-Agents:{c_reset}")
+            for ua, count in stats["user_agents"].most_common(5):
+                col_derecha.append(f"  - ({count}) {self._truncar_texto(ua, 35)}")
+
+        # Calcular ancho visible de la columna izquierda sin ANSI
+        def visible_len(s: str) -> int:
+            return len(re.sub(r"\033\[[0-9;]*m", "", s))
+
+        ancho_col_izquierda = (
+            max((visible_len(linea) for linea in col_izquierda), default=0)
+            if col_izquierda
+            else 0
+        )
+
+        for izq, der in zip_longest(col_izquierda, col_derecha, fillvalue=""):
+            pad = " " * max(0, (ancho_col_izquierda - visible_len(izq)))
+            linea_izq_padded = f"{izq}{pad}"
+            add(f"{linea_izq_padded}  |  {der}")
+
+        return output
+
+    def _renderizar_texto_lista(self, stats):
+        output = []
+        add = output.append
+        c_head, c_sub, c_reset = (
+            ("\033[1;34m", "\033[1;36m", "\033[0m") if should_use_color() else ("", "", "")
+        )
+
+        add(f"\n{c_head}=== ESTADÍSTICAS DEL LOG (VISTA DE LISTA) ==={c_reset}")
         add(f"Líneas totales: {stats.get('total_lineas', 0):,}")
         add(f"Errores: {stats.get('errores_count', 0)}")
         add(f"Advertencias: {stats.get('warnings_count', 0)}")
 
-        if stats.get('timestamps'):
+        if stats.get("timestamps"):
             add(f"\n{c_head}Rango temporal:{c_reset}")
             add(f"  Desde: {stats['timestamps'][0]}")
             add(f"  Hasta: {stats['timestamps'][-1]}")
 
-        if stats.get('codigos_estado_http'):
-            add(f"\n{c_head}Códigos de Estado HTTP:{c_reset}")
-            for code, count in stats['codigos_estado_http'].most_common():
+        add(f"\n{c_head}Códigos de Estado HTTP:{c_reset}")
+        if stats.get("codigos_estado_http"):
+            for code, count in stats["codigos_estado_http"].most_common():
                 add(f"  - Código {code}: {count} veces")
-            resumen_rangos = self._agrupar_codigos_http(stats['codigos_estado_http'])
+            resumen = self._agrupar_codigos_http(stats["codigos_estado_http"])
             add(f"\n  {c_sub}Resumen por rangos:{c_reset}")
-            for rango, count in sorted(resumen_rangos.items()):
+            for rango, count in sorted(resumen.items()):
                 add(f"    - {rango}: {count} peticiones")
+        else:
+            add("  (Sin datos)")
 
-        if stats.get('urls_mas_solicitadas'):
+        if stats.get("urls_mas_solicitadas"):
             add(f"\n{c_head}Top 5 URLs Más Solicitadas:{c_reset}")
-            for url, count in stats['urls_mas_solicitadas'].most_common(5):
+            for url, count in stats["urls_mas_solicitadas"].most_common(5):
                 add(f"  - ({count} veces) {self._truncar_texto(url)}")
 
-        if stats.get('user_agents'):
+        if stats.get("user_agents"):
             add(f"\n{c_head}Top 5 User-Agents:{c_reset}")
-            for ua, count in stats['user_agents'].most_common(5):
+            for ua, count in stats["user_agents"].most_common(5):
                 add(f"  - ({count} veces) {self._truncar_texto(ua)}")
 
-        if stats.get('errores_especificos'):
-            add(f"\n{c_head}Top 5 Errores Específicos:{c_reset}")
-            for error, count in stats['errores_especificos'].most_common(5):
-                add(f"  - ({count} veces) {self._truncar_texto(error)}")
+        if stats.get("actividad_sospechosa"):
+            add(f"\n{c_head}Alertas de Seguridad Detectadas:{c_reset}")
+            for tipo, count in stats["actividad_sospechosa"].items():
+                add(f"  - Posibles intentos de {tipo.replace('_', ' ')}: {count} veces")
 
-        if stats.get('ips'):
+        if stats.get("ips"):
             add(f"\n{c_head}Top 10 IPs con Geolocalización:{c_reset}")
             add(f"{'VECES':<7} {'IP':<18} {'PAÍS'}")
             add(f"{'-----':<7} {'------------------':<18} {'------'}")
-            for ip, count in stats['ips'].most_common(10):
+            for ip, count in stats["ips"].most_common(10):
                 country = self._get_country_for_ip(ip)
                 add(f"{count:<7} {ip:<18} {country}")
 
         return output
 
     def _mostrar_estadisticas_texto(self, stats):
-        for linea in self._renderizar_texto(stats):
+        render_func = self._renderizar_texto_lista if self.list_view else self._renderizar_texto_columnas
+        for linea in render_func(stats):
             print(linea)
 
-    def _mostrar_json(self, stats):
-        stats_json = {
-            'resumen': {
-                'archivo': self.archivo_log,
-                'lineas_totales': stats.get('total_lineas', 0),
-                'total_errores': stats.get('errores_count', 0),
-                'total_warnings': stats.get('warnings_count', 0),
-                'periodo': {
-                    'desde': stats['timestamps'][0] if stats.get('timestamps') else None,
-                    'hasta': stats['timestamps'][-1] if stats.get('timestamps') else None,
-                }
+    def _preparar_json(self, stats):
+        return {
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "resumen": {
+                "archivo": self.archivo_log,
+                "lineas_totales": stats.get("total_lineas", 0),
+                "total_errores": stats.get("errores_count", 0),
+                "total_warnings": stats.get("warnings_count", 0),
+                "periodo": {
+                    "desde": stats["timestamps"][0]
+                    if stats.get("timestamps")
+                    else None,
+                    "hasta": stats["timestamps"][-1]
+                    if stats.get("timestamps")
+                    else None,
+                },
             },
-            'metodos_http': stats.get('metodos_http', {}),
-            'codigos_estado_http': stats.get('codigos_estado_http', {}),
-            'top_urls': stats.get('urls_mas_solicitadas', Counter()).most_common(10),
-            'top_user_agents': stats.get('user_agents', Counter()).most_common(5),
-            'top_errores': stats.get('errores_especificos', Counter()).most_common(10),
-            'top_ips': [
-                {'ip': ip, 'count': count, 'pais': self._get_country_for_ip(ip)}
-                for ip, count in stats.get('ips', Counter()).most_common(20)
+            "alertas_seguridad": stats.get("actividad_sospechosa", {}),
+            "metodos_http": stats.get("metodos_http", {}),
+            "codigos_estado_http": stats.get("codigos_estado_http", {}),
+            "top_urls": stats.get("urls_mas_solicitadas", Counter()).most_common(10),
+            "top_user_agents": stats.get("user_agents", Counter()).most_common(5),
+            "top_errores": stats.get("errores_especificos", Counter()).most_common(10),
+            "top_ips": [
+                {"ip": ip, "count": count, "pais": self._get_country_for_ip(ip)}
+                for ip, count in stats.get("ips", Counter()).most_common(20)
             ],
         }
-        print(json.dumps(stats_json, indent=2, ensure_ascii=False))
+
+    def _mostrar_json(self, stats):
+        print(json.dumps(self._preparar_json(stats), indent=2, ensure_ascii=False))
 
     def _guardar_resultados(self, datos, archivo_salida):
         try:
-            with open(archivo_salida, 'w', encoding='utf-8') as f:
+            with open(archivo_salida, "w", encoding="utf-8") as f:
                 if self.json_output:
-                    # Si el modo es JSON, simplemente volcamos los datos
-                    self._mostrar_json(datos)
-                elif 'coincidencias' in datos:
+                    # Si es búsqueda de patrón, guarda ese dict tal cual en JSON
+                    if isinstance(datos, dict) and "coincidencias" in datos:
+                        json.dump(datos, f, indent=2, ensure_ascii=False)
+                    else:
+                        json.dump(self._preparar_json(datos), f, indent=2, ensure_ascii=False)
+                elif isinstance(datos, dict) and "coincidencias" in datos:
                     f.write(f"Búsqueda de patrón: {datos['patron']}\n")
                     f.write(f"Total de coincidencias: {datos['total_encontradas']}\n\n")
-                    for i, linea in enumerate(datos['coincidencias'], 1):
+                    for i, linea in enumerate(datos["coincidencias"], 1):
                         f.write(f"{i}: {linea}\n")
                 else:
-                    informe_texto = self._renderizar_texto(datos)
-                    clean_informe = [re.sub(r'\033\[[0-9;]*m', '', linea) for linea in informe_texto]
-                    f.write('\n'.join(clean_informe))
+                    render_func = (
+                        self._renderizar_texto_lista if self.list_view else self._renderizar_texto_columnas
+                    )
+                    informe_texto = render_func(datos)
+                    clean_informe = [
+                        re.sub(r"\033\[[0-9;]*m", "", linea) for linea in informe_texto
+                    ]
+                    f.write("\n".join(clean_informe))
             c_ok, c_reset = ("\033[1;32m", "\033[0m") if should_use_color() else ("", "")
             print(f"{c_ok}Resultados guardados en: {archivo_salida}{c_reset}")
         except Exception as e:
@@ -362,47 +542,69 @@ class AnalizadorLogs:
 
 
 def parsear_fecha(fecha_str):
-    """Convierte string de fecha a datetime object."""
     try:
-        return datetime.strptime(fecha_str, '%Y-%m-%d')
+        return datetime.strptime(fecha_str, "%Y-%m-%d")
     except ValueError:
         try:
-            return datetime.strptime(fecha_str, '%Y-%m-%d %H:%M:%S')
+            return datetime.strptime(fecha_str, "%Y-%m-%d %H:%M:%S")
         except ValueError:
-            raise argparse.ArgumentTypeError(f"Fecha no válida: '{fecha_str}'. Use YYYY-MM-DD o 'YYYY-MM-DD HH:MM:SS'")
+            raise argparse.ArgumentTypeError(
+                f"Fecha no válida: '{fecha_str}'. Use YYYY-MM-DD o 'YYYY-MM-DD HH:MM:SS'"
+            )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Analizador avanzado de logs con optimización de memoria y geolocalización.',
+        description="Analizador avanzado de logs con optimización de memoria y geolocalización.",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog='''
 Ejemplos de uso:
-  %(prog)s access.log                           # Análisis completo (sin límites)
+  %(prog)s access.log                           # Análisis completo (vista en columnas)
+  %(prog)s access.log --vista-lista             # Análisis completo (vista en lista simple)
   %(prog)s error.log -p "Timeout" -c 50         # Buscar timeouts
   %(prog)s app.log --json --output resultado.json # Salida JSON
   %(prog)s access.log --since 2024-01-01 --until "2024-01-31 23:59:59" # Filtro temporal
-  %(prog)s huge.log --max-ips 5000 --max-errors 1000  # Limitar memoria en logs grandes
-        '''
+  zcat access.log.gz | %(prog)s -               # Leer desde stdin en un pipeline
+        ''',
     )
-
-    parser.add_argument('archivo', help='Archivo de log a analizar (puede ser .gz)')
-    parser.add_argument('-p', '--patron', help='Patrón específico a buscar (desactiva el análisis general)')
-    parser.add_argument('-c', '--contar', type=int, default=10, help='Número de resultados a mostrar para la búsqueda por patrón')
-    parser.add_argument('--json', action='store_true', help='Muestra la salida en formato JSON')
-    parser.add_argument('--output', help='Archivo de salida para guardar resultados')
-    parser.add_argument('--since', type=parsear_fecha, help='Filtrar logs desde esta fecha (YYYY-MM-DD o "YYYY-MM-DD HH:MM:SS")')
-    parser.add_argument('--until', type=parsear_fecha, help='Filtrar logs hasta esta fecha (YYYY-MM-DD o "YYYY-MM-DD HH:MM:SS")')
-    parser.add_argument('--max-ips', type=int, help='Límite opcional de IPs únicas a rastrear (por memoria)')
-    parser.add_argument('--max-errors', type=int, help='Límite opcional de errores únicos a rastrear')
-    parser.add_argument('--geoip-db', help='Ruta alternativa a la base de datos GeoIP')
-    parser.add_argument('-v', '--verbose', action='store_true', help='Habilita logging verbose para debugging')
+    parser.add_argument(
+        "archivo", help="Archivo de log a analizar (puede ser .gz o '-' para stdin)"
+    )
+    parser.add_argument("-p", "--patron", help="Patrón específico a buscar")
+    parser.add_argument("-c", "--contar", type=int, default=10, help="Número de resultados a mostrar")
+    parser.add_argument("--json", action="store_true", help="Muestra la salida en formato JSON")
+    parser.add_argument("--output", help="Archivo de salida para guardar resultados")
+    parser.add_argument(
+        "--vista-lista",
+        "--list-view",
+        dest="vista_lista",
+        action="store_true",
+        help="Mostrar resultados como una lista en lugar de columnas",
+    )
+    parser.add_argument(
+        "--since",
+        type=parsear_fecha,
+        help="Filtrar logs desde esta fecha (YYYY-MM-DD o 'YYYY-MM-DD HH:MM:SS')",
+    )
+    parser.add_argument(
+        "--until",
+        type=parsear_fecha,
+        help="Filtrar logs hasta esta fecha (YYYY-MM-DD o 'YYYY-MM-DD HH:MM:SS')",
+    )
+    parser.add_argument("--max-ips", type=int, help="Límite opcional de IPs únicas a rastrear")
+    parser.add_argument(
+        "--max-errors", type=int, help="Límite opcional de errores únicos a rastrear"
+    )
+    parser.add_argument("--geoip-db", help="Ruta alternativa a la base de datos GeoIP")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Habilita logging verbose para debugging")
 
     args = parser.parse_args()
 
-    if not os.path.isfile(args.archivo):
+    if args.archivo != "-" and not os.path.isfile(args.archivo):
         c_err, c_reset = ("\033[1;31m", "\033[0m") if should_use_color() else ("", "")
-        print(f"{c_err}Error: El archivo {args.archivo} no existe o no es un archivo regular.{c_reset}")
+        print(
+            f"{c_err}Error: El archivo {args.archivo} no existe o no es un archivo regular.{c_reset}"
+        )
         sys.exit(1)
 
     analizador = AnalizadorLogs(
@@ -411,7 +613,8 @@ Ejemplos de uso:
         geoip_db_path=args.geoip_db,
         max_ips=args.max_ips,
         max_errors=args.max_errors,
-        verbose=args.verbose
+        verbose=args.verbose,
+        list_view=args.vista_lista,
     )
 
     analizador.analizar(
@@ -419,7 +622,7 @@ Ejemplos de uso:
         contar=args.contar,
         since=args.since,
         until=args.until,
-        output_file=args.output
+        output_file=args.output,
     )
 
 
