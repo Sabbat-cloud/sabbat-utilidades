@@ -2,68 +2,177 @@
 
 > **"Tus logs tienen una historia que contar. `sabbat-analizalogs` la descifra por ti."**
 
-`sabbat-analizalogs` es una herramienta de línea de comandos de alto rendimiento para el análisis de logs. Combina la funcionalidad de `grep`, `sort`, `uniq -c`, `awk` y herramientas de geolocalización en una única utilidad potente, diseñada para ofrecer una visión completa de la actividad de un sistema a través de sus logs.
+Este proyecto es un **analizador avanzado de logs** escrito en Python 3. Permite procesar archivos de logs (normales o comprimidos en `.gz`) y generar estadísticas útiles como:
 
-## Características
+- Conteo de errores y advertencias.
+- Top IPs con geolocalización (requiere base de datos GeoIP).
+- Métodos HTTP y códigos de estado más frecuentes.
+- URLs más solicitadas.
+- Principales *User-Agents*.
+- Detección de actividad sospechosa (SQL Injection, XSS, Path Traversal).
+- Rango temporal de los eventos del log.
+- Exportación de resultados en texto o JSON.
 
-  - **Análisis de Alto Rendimiento**: Procesa archivos de log de cualquier tamaño (incluyendo **archivos `.gz` comprimidos**) línea por línea, manteniendo un bajo consumo de memoria.
-  - **Estadísticas Enriquecidas**: Genera un panel de control completo en la terminal:
-      - **Top IPs** con **geolocalización** por país.
-      - **Top Errores** específicos y URLs más solicitadas.
-      - Resumen de **códigos de estado HTTP** (individuales y agrupados por rangos `2xx`, `4xx`, etc.).
-      - Conteo de **User-Agents** y métodos HTTP.
-  - **Filtrado Avanzado**: Permite acotar el análisis a un **rango de fechas y horas** específico con las opciones `--since` y `--until`.
-  - **Salida Flexible**:
-      - **Modo Texto**: Informe claro y legible para humanos, con colores para una mejor visualización.
-      - **Modo JSON**: Salida estructurada ideal para la integración con otros scripts, herramientas de monitoreo o pipelines de CI/CD.
-  - **Robusto y Configurable**:
-      - **Gestión de memoria**: Opciones `--max-ips` y `--max-errors` para controlar el uso de recursos en archivos masivos.
-      - **Salida a archivo**: Guarda los resultados directamente con la opción `--output`.
-      - **Modo Verbose**: Ofrece información de debugging para un análisis más profundo.
+---
+
+## Características principales
+
+- Soporte de logs comprimidos (`.gz`).
+- Lectura desde **stdin** (`-`) para usar en pipelines.
+- Filtros temporales con `--since` y `--until`.
+- Vista en columnas o en lista (`--vista-lista`).
+- Salida en JSON (`--json`) para integración con otras herramientas.
+- Guardado en archivo (`--output`).
+- Detección básica de intentos de ataque comunes.
+- Uso opcional de **GeoIP2** para geolocalizar IPs.
+
+---
+
+## Requisitos
+
+- Python 3.7+
+- Librerías:
+  ```bash
+  pip install -r requirements.txt
+  ```
+- Base de datos GeoIP (ejemplo: `GeoLite2-Country.mmdb` de MaxMind) en `/var/lib/GeoIP/` o ruta especificada con `--geoip-db`.
+
+---
 
 ## Instalación
 
+Clona este repositorio:
+
 ```bash
-# Clona el repositorio (si aún no lo has hecho)
-git clone https://github.com/sababt-cloud/sabbat-utilidades.git
-cd sabbat-utilidades
-
-# Hazlo ejecutable y enlázalo en tu PATH
-sudo cp sabbat-analizalogs /usr/local/bin/
-sudo chmod +x /usr/local/bin/sabbat-analizalogs
-
-# Instala la dependencia necesaria para la geolocalización de IPs
-pip3 install geoip2-database
-
-# Nota: El script necesita una base de datos de GeoIP. 
-# La buscará por defecto en /var/lib/GeoIP/GeoLite2-Country.mmdb.
-# Puedes usar --geoip-db para especificar otra ruta.
+git clone https://github.com/sabbat-cloud/sabbat-utilidades
 ```
+
+Instala las dependencias:
+
+```bash
+pip install -r requirements.txt
+```
+
+---
 
 ## Uso
 
-Aquí tienes algunos ejemplos prácticos de cómo usar `sabbat-analiza`:
-
-#### 1\. Análisis general de un log de acceso
+### Ejemplos básicos
 
 ```bash
-sabbat-analizalogs /var/log/access.log
+# Análisis completo en vista columnas
+python3 sabbat-analizalogs access.log
+
+# Análisis completo en vista lista
+python3 sabbat-analizalogs access.log --vista-lista
+
+# Búsqueda de un patrón específico
+python3 sabbat-analizalogs error.log -p "Timeout" -c 50
+
+# Salida JSON
+python3 sabbat-analizalogs app.log --json
+
+# Guardar salida en archivo JSON
+python3 sabbat-analizalogsy app.log --json --output resultado.json
+
+# Filtrar logs por fechas
+python3 sabbat-analizalogs access.log --since 2024-01-01 --until "2024-01-31 23:59:59"
+
+# Usar en un pipeline (leer de stdin)
+zcat access.log.gz | python3 sabbat-analizalogs - --json
 ```
 
-#### 2\. Buscar un patrón específico y mostrar las 50 primeras coincidencias
+---
 
-```bash
-sabbat-analizalogs error.log -p "Connection timed out" -c 50
+## Opciones disponibles
+
+```text
+archivo                 Archivo de log a analizar (puede ser .gz o '-' para stdin)
+
+-p, --patron            Patrón específico a buscar
+-c, --contar            Número de resultados a mostrar (por defecto 10)
+--json                  Muestra la salida en formato JSON
+--output                Archivo de salida para guardar resultados
+--vista-lista           Muestra resultados como lista en lugar de columnas
+--since                 Filtrar logs desde esta fecha (YYYY-MM-DD o 'YYYY-MM-DD HH:MM:SS')
+--until                 Filtrar logs hasta esta fecha (YYYY-MM-DD o 'YYYY-MM-DD HH:MM:SS')
+--max-ips               Límite opcional de IPs únicas a rastrear
+--max-errors            Límite opcional de errores únicos a rastrear
+--geoip-db              Ruta alternativa a la base de datos GeoIP
+-v, --verbose           Habilita logging verbose para debugging
 ```
 
-#### 3\. Analizar un log, filtrar por fecha y guardar el resultado en JSON
+---
 
-```bash
-sabbat-analizalogs huge_access.log.gz --since 2025-09-28 --until "2025-09-29 12:00:00" --json --output report.json
+## Ejemplo de salida
+
+### Vista en columnas
+```
+=== ESTADÍSTICAS DEL LOG ===
+Líneas totales: 123,456
+Errores: 120 | Advertencias: 45
+Periodo: De 2024-01-01 00:00:00 a 2024-01-31 23:59:59
+
+Alertas de Seguridad Detectadas:
+SQL Injection (5) | Xss Attempt (2)
+
+--------------------------------------------------------------------------------
+Códigos de Estado HTTP:
+  - Código 200: 102345 veces
+  - Código 404: 1234 veces
+  Resumen por rangos:
+    - 2xx: 102345 peticiones
+    - 4xx: 1234 peticiones
+
+Top 5 URLs Solicitadas:
+  - (/index.html)
+  - (/login)
+
+Top 10 IPs con Geolocalización:
+VECES   IP                 PAÍS
+-----   ------------------ ------
+234     203.0.113.5        United States
+...
 ```
 
-#### 4\. Analizar un log muy grande limitando el uso de memoria
-
-```bash
-sabbat-analizalogs massive.log --max-ips 5000 --max-errors 1000
+### JSON
+```json
+{
+  "generated_at": "2024-02-01T10:30:00Z",
+  "resumen": {
+    "archivo": "access.log",
+    "lineas_totales": 123456,
+    "total_errores": 120,
+    "total_warnings": 45,
+    "periodo": {
+      "desde": "2024-01-01 00:00:00",
+      "hasta": "2024-01-31 23:59:59"
+    }
+  },
+  "alertas_seguridad": {"sql_injection": 5, "xss_attempt": 2},
+  "metodos_http": {"GET": 100000, "POST": 20000},
+  "codigos_estado_http": {"200": 102345, "404": 1234},
+  "top_urls": [["/index.html", 5000], ["/login", 4000]],
+  "top_user_agents": [["Mozilla/5.0 ...", 60000]],
+  "top_errores": [["Timeout <NUM>", 50]],
+  "top_ips": [{"ip": "203.0.113.5", "count": 234, "pais": "United States"}]
+}
 ```
+
+---
+
+## requirements.txt
+
+El proyecto incluye un fichero `requirements.txt` para instalar las dependencias:
+
+```text
+geoip2>=4.6.0
+```
+
+(Opcionalmente puedes añadir `pytest` u otras librerías si deseas tests o utilidades extra).
+
+---
+
+## Licencia
+
+Este proyecto se distribuye bajo la licencia MIT.
