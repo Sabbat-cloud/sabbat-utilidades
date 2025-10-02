@@ -185,11 +185,3 @@ This project is distributed under the MIT License.
 _For full documentation and latest updates, see the GitHub repository: [https://github.com/sabbat-cloud/sabbat-utilidades](https://github.com/sabbat-cloud/sabbat-utilidades)_
 ```
 
-[1](https://www.makeareadme.com)
-[2](https://realpython.com/readme-python-project/)
-[3](https://github.com/othneildrew/Best-README-Template)
-[4](https://www.youtube.com/watch?v=12trn2NKw5I)
-[5](https://www.pyopensci.org/python-package-guide/tutorials/add-readme.html)
-[6](https://packaging.python.org/guides/making-a-pypi-friendly-readme/)
-[7](https://www.reddit.com/r/opensource/comments/txl9zq/next_level_readme/)
-[8](https://gitlab.com/ton1czech/project-readme-template)
