@@ -9,7 +9,7 @@ import gzip
 import ipaddress
 import logging
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 from itertools import zip_longest
 
@@ -24,9 +24,24 @@ except ImportError:
     geoip2 = None
 
 
+SCHEMA_VERSION = "1.1.0"
+
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
 def should_use_color():
     """Returns True if the output is a terminal (so ANSI colors can be used) and NO_COLOR is not set."""
     return sys.stdout.isatty() and not os.getenv("NO_COLOR")
+
+
+def positive_int(value):
+    try:
+        iv = int(value)
+    except Exception:
+        raise argparse.ArgumentTypeError(f"Invalid int value: {value}")
+    if iv <= 0:
+        raise argparse.ArgumentTypeError(f"Value must be > 0 (got {iv})")
+    return iv
 
 
 class LogAnalyzer:
@@ -39,6 +54,10 @@ class LogAnalyzer:
         max_errors=None,
         verbose=False,
         list_view=False,
+        sanitize_ansi=True,
+        top_urls=5,
+        top_uas=5,
+        top_ips=20,
     ):
         self.log_file = log_file
         self.json_output = json_output
@@ -46,15 +65,23 @@ class LogAnalyzer:
         self.max_errors = max_errors
         self.geoip_db_path = geoip_db_path or GEOIP_DB_PATH
         self.list_view = list_view
+        self.sanitize_ansi = sanitize_ansi
+        self.top_urls = top_urls
+        self.top_uas = top_uas
+        self.top_ips = top_ips
 
         self._init_logger(verbose)
         self.geoip_cache = {}
         self.suspicious_patterns = {
+            # Endurecidas y sin rama vacía
             "sql_injection": re.compile(
-                r"(?i)(?:\bUNION\b.+\bSELECT\b|\bSELECT\b|\bINSERT\b|\bDROP\b|\bDELETE\b|%27|--\s|/*|\bSLEEP\(|INFORMATION_SCHEMA)"
+                r"(?i)(?:\bUNION\b.*\bSELECT\b|\bOR\b\s+1=1\b|--|#|/\*|\bSLEEP\s*\(|\bINFORMATION_SCHEMA\b|\bLOAD_FILE\s*\(|\bXP_CMDSHELL\b)"
             ),
-            "path_traversal": re.compile(r"(\.\./|\.\.\|%2e%2e/)", re.IGNORECASE),
-            "xss_attempt": re.compile(r"(?i)(?:<script\b|javascript:|on\w+=)")
+            # Se corrige el typo y se añade codificación común
+            "path_traversal": re.compile(
+                r"(?i)(?:\.\./|%2e%2e/|%2e%2e%2f|\.%2e/|%2e\./)"
+            ),
+            "xss_attempt": re.compile(r"(?i)(?:<script\b|javascript:|on\w+=)"),
         }
 
         self.patterns = {
@@ -81,9 +108,7 @@ class LogAnalyzer:
 
     def _load_geoip(self):
         if not geoip2:
-            self.logger.warning(
-                "geoip2 module not installed. Geolocation is disabled."
-            )
+            self.logger.warning("geoip2 module not installed. Geolocation is disabled.")
             return None
         try:
             reader = geoip2.database.Reader(self.geoip_db_path)
@@ -104,9 +129,7 @@ class LogAnalyzer:
                 # Allow stdin for pipelines
                 return sys.stdin
             if self.log_file.endswith(".gz"):
-                return gzip.open(
-                    self.log_file, "rt", encoding="utf-8", errors="ignore"
-                )
+                return gzip.open(self.log_file, "rt", encoding="utf-8", errors="ignore")
             else:
                 return open(self.log_file, "r", encoding="utf-8", errors="ignore")
         except Exception as e:
@@ -121,21 +144,20 @@ class LogAnalyzer:
                 continue
             try:
                 ip_obj = ipaddress.ip_address(candidate)
+                # Solo IPs globales enrutable (excluye privadas/reservadas)
                 if getattr(ip_obj, "is_global", False):
                     valid_ips.append(str(ip_obj))
             except ValueError:
                 continue
         return valid_ips
 
-    def analyze(
-        self, pattern=None, count=10, since=None, until=None, output_file=None
-    ):
+    def analyze(self, pattern=None, count=10, since=None, until=None, output_file=None, unsafe_output=False, force=False):
         try:
             with self.open_file() as file_obj:
                 if pattern:
                     results = self._search_pattern(file_obj, pattern, count, since, until)
                     if output_file:
-                        self._save_results(results, output_file)
+                        self._save_results(results, output_file, unsafe_output=unsafe_output, force=force)
                     else:
                         if self.json_output:
                             print(json.dumps(results, indent=2, ensure_ascii=False))
@@ -144,7 +166,7 @@ class LogAnalyzer:
                 else:
                     stats = self._generate_statistics(file_obj, since, until)
                     if output_file:
-                        self._save_results(stats, output_file)
+                        self._save_results(stats, output_file, unsafe_output=unsafe_output, force=force)
                     elif self.json_output:
                         self._show_json(stats)
                     else:
@@ -166,28 +188,40 @@ class LogAnalyzer:
             print(json.dumps(error_msg, indent=4, ensure_ascii=False))
         else:
             msg = f"Error: {error_msg['error']}"
+            if self.sanitize_ansi:
+                msg = ANSI_RE.sub("", msg)
             print(f"\033[1;31m{msg}\033[0m" if should_use_color() else msg)
         sys.exit(1)
+
+    def _parse_log_time_utc(self, line):
+        """Devuelve datetime naïve en UTC (sin tzinfo) o None si no se puede parsear."""
+        iso_match = re.search(self.patterns["timestamp_iso"], line)
+        apache_match = re.search(self.patterns["timestamp_apache"], line)
+        try:
+            if iso_match:
+                raw = iso_match.group(0)
+                # datetime.fromisoformat no soporta 'Z' directo en Python<3.11; normalizamos
+                if raw.endswith("Z"):
+                    raw = raw[:-1] + "+00:00"
+                # quitar fracciones para homogeneizar
+                raw_clean = re.sub(r"\.\d+", "", raw)
+                dt = datetime.fromisoformat(raw_clean)
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                return dt
+            elif apache_match:
+                raw = apache_match.group(0)
+                dt = datetime.strptime(raw, "%d/%b/%Y:%H:%M:%S %z").astimezone(timezone.utc).replace(tzinfo=None)
+                return dt
+        except Exception as e:
+            self.logger.debug(f"Could not parse timestamp: {e}")
+            return None
+        return None
 
     def _in_time_range(self, line, since, until):
         if not (since or until):
             return True
-        iso_match = re.search(self.patterns["timestamp_iso"], line)
-        apache_match = re.search(self.patterns["timestamp_apache"], line)
-        log_time = None
-        try:
-            if iso_match:
-                log_time_str_full = iso_match.group(0).replace("T", " ")
-                log_time_str = re.sub(r"\.\d+", "", log_time_str_full)
-                log_time = datetime.strptime(log_time_str, "%Y-%m-%d %H:%M:%S")
-            elif apache_match:
-                log_time_str = apache_match.group(0)
-                log_time = (
-                    datetime.strptime(log_time_str, "%d/%b/%Y:%H:%M:%S %z").replace(tzinfo=None)
-                )
-        except ValueError as e:
-            self.logger.debug(f"Could not parse timestamp: {e}")
-            return True
+        log_time = self._parse_log_time_utc(line)
         if log_time is None:
             return True
         if since and log_time < since:
@@ -206,39 +240,34 @@ class LogAnalyzer:
             if regex.search(line):
                 total += 1
                 if len(first_matches) < count:
-                    first_matches.append(line.strip())
+                    line_out = line.rstrip("\n")
+                    if self.sanitize_ansi:
+                        line_out = ANSI_RE.sub("", line_out)
+                    first_matches.append(line_out)
         return {
+            "schema_version": SCHEMA_VERSION,
             "pattern": pattern,
             "matches": first_matches,
             "total_found": total,
         }
 
-    def _show_pattern_search(self, results):
-        c_prefix, c_reset = ("\033[1;32m", "\033[0m") if should_use_color() else ("", "")
-        print(f"\n{c_prefix}Searching for matches of '{results['pattern']}':{c_reset}")
-        print(
-            f"Showing {len(results['matches'])} of {results['total_found']} matches:\n"
-        )
-        for i, line in enumerate(results["matches"], 1):
-            print(f"{i}: {line}")
-
     def _generate_statistics(self, file_iterable, since=None, until=None):
-        stats = Counter()
-        stats.update(
-            {
-                k: Counter()
-                for k in [
-                    "ips",
-                    "specific_errors",
-                    "top_urls",
-                    "user_agents",
-                    "http_methods",
-                    "http_status_codes",
-                    "suspicious_activity",
-                ]
-            }
-        )
-        timestamps = []
+        stats = {
+            "ips": Counter(),
+            "specific_errors": Counter(),
+            "top_urls": Counter(),
+            "user_agents": Counter(),
+            "http_methods": Counter(),
+            "http_status_codes": Counter(),
+            "suspicious_activity": Counter(),
+            "total_lines": 0,
+            "errors_count": 0,
+            "warnings_count": 0,
+            # guardaremos solo primera y última marca tal cual aparecen
+            "timestamps": [],
+        }
+        first_ts = None
+        last_ts = None
         processed_lines = 0
 
         PatternT = getattr(re, "Pattern", type(re.compile("")))
@@ -259,14 +288,17 @@ class LogAnalyzer:
                     "<NUM>",
                     message,
                 )
-                if self.max_errors is None or len(stats["specific_errors"]) < self.max_errors:
+                # límites sin sesgo: si ya existe, siempre incrementa
+                if (message in stats["specific_errors"] or
+                    self.max_errors is None or len(stats["specific_errors"]) < self.max_errors):
                     stats["specific_errors"][message] += 1
 
             if regex_dict["warning"].search(line):
                 stats["warnings_count"] += 1
 
             for ip in self.extract_valid_ips(line):
-                if self.max_ips is None or len(stats["ips"]) < self.max_ips:
+                if (ip in stats["ips"] or
+                    self.max_ips is None or len(stats["ips"]) < self.max_ips):
                     stats["ips"][ip] += 1
 
             http_match = regex_dict["http_full"].search(line)
@@ -275,11 +307,14 @@ class LogAnalyzer:
                 stats["http_methods"][method] += 1
                 stats["http_status_codes"][code] += 1
                 stats["top_urls"][url] += 1
-                if ("?" in url or "=" in url or "%" in url):
-                    for name, pattern in self.suspicious_patterns.items():
-                        if pattern.search(url):
-                            stats["suspicious_activity"][name] += 1
 
+                # Analizar SIEMPRE por si la ruta lleva payload sospechoso
+                url_lower = url.lower()
+                for name, pattern in self.suspicious_patterns.items():
+                    if pattern.search(url_lower):
+                        stats["suspicious_activity"][name] += 1
+
+            # User-Agent heurística
             ua = None
             ua_tail = regex_dict["user_agent_tail"].search(line)
             if ua_tail:
@@ -289,24 +324,24 @@ class LogAnalyzer:
                 if ua_match:
                     ua = ua_match.group(1).strip()
             if ua and ua != "-":
+                if len(ua) > 200:
+                    ua = ua[:200] + "…"
                 stats["user_agents"][ua] += 1
 
+            # timestamps mostrados (no en UTC, sino tal y como aparecen)
             ts_iso = regex_dict["timestamp_iso"].search(line)
             ts_apache = regex_dict["timestamp_apache"].search(line)
-            if ts_iso:
-                timestamps.append(ts_iso.group(0))
-            elif ts_apache:
-                timestamps.append(ts_apache.group(0))
+            ts_display = ts_iso.group(0) if ts_iso else (ts_apache.group(0) if ts_apache else None)
+            if ts_display:
+                if first_ts is None:
+                    first_ts = ts_display
+                last_ts = ts_display
 
-        if (
-            self.max_ips is None
-            and self.max_errors is None
-            and processed_lines > 100_000
-        ):
+        if (self.max_ips is None and self.max_errors is None and processed_lines > 100_000):
             self.logger.warning(
                 f"Large log file ({processed_lines:,} lines). Consider using --max-ips or --max-errors."
             )
-        stats["timestamps"] = [timestamps[0], timestamps[-1]] if timestamps else []
+        stats["timestamps"] = [first_ts, last_ts] if first_ts else []
         return stats
 
     def _get_country_for_ip(self, ip):
@@ -335,27 +370,23 @@ class LogAnalyzer:
     def _truncate_text(self, text, length=40):
         return text[:length] + "..." if len(text) > length else text
 
+    def _visible_len(self, s: str) -> int:
+        return len(ANSI_RE.sub("", s))
+
     def _render_columns(self, stats):
         output = []
         add = output.append
-        c_head, c_sub, c_reset = (
-            ("\033[1;34m", "\033[1;36m", "\033[0m") if should_use_color() else ("", "", "")
-        )
+        c_head, c_sub, c_reset = (("\033[1;34m", "\033[1;36m", "\033[0m") if should_use_color() else ("", "", ""))
 
         add(f"\n{c_head}=== LOG STATISTICS ==={c_reset}")
         add(f"Total lines: {stats.get('total_lines', 0):,}")
-        add(
-            f"Errors: {stats.get('errors_count', 0)} | Warnings: {stats.get('warnings_count', 0)}"
-        )
+        add(f"Errors: {stats.get('errors_count', 0)} | Warnings: {stats.get('warnings_count', 0)}")
         if stats.get("timestamps"):
             add(f"Period: From {stats['timestamps'][0]} to {stats['timestamps'][-1]}")
 
         if stats.get("suspicious_activity"):
             add(f"\n{c_head}Detected Security Alerts:{c_reset}")
-            alerts = [
-                f"{type.replace('_', ' ').title()} ({count})"
-                for type, count in stats["suspicious_activity"].items()
-            ]
+            alerts = [f"{t.replace('_', ' ').title()} ({c})" for t, c in stats["suspicious_activity"].items()]
             add(" | ".join(alerts))
 
         add(f"\n{'-'*80}")
@@ -375,36 +406,26 @@ class LogAnalyzer:
 
         if stats.get("top_urls"):
             left_col.append("")
-            left_col.append(f"{c_sub}Top 5 Requested URLs:{c_reset}")
-            for url, count in stats["top_urls"].most_common(5):
+            left_col.append(f"{c_sub}Top {min(self.top_urls,5)} Requested URLs:{c_reset}")
+            for url, count in stats["top_urls"].most_common(self.top_urls):
                 left_col.append(f"  - ({count}) {self._truncate_text(url, 35)}")
 
         if stats.get("ips"):
-            right_col.append(f"{c_sub}Top 10 IPs with Geolocation:{c_reset}")
+            right_col.append(f"{c_sub}Top {min(self.top_ips,10)} IPs with Geolocation:{c_reset}")
             right_col.append(f"{'COUNT':<7} {'IP':<18} {'COUNTRY'}")
             right_col.append(f"{'-----':<7} {'------------------':<18} {'------'}")
-            for ip, count in stats["ips"].most_common(10):
+            for ip, count in stats["ips"].most_common(self.top_ips):
                 country = self._get_country_for_ip(ip)
-                right_col.append(
-                    f"{count:<7} {ip:<18} {self._truncate_text(country, 15)}"
-                )
+                right_col.append(f"{count:<7} {ip:<18} {self._truncate_text(country, 15)}")
         if stats.get("user_agents"):
             right_col.append("")
-            right_col.append(f"{c_sub}Top 5 User-Agents:{c_reset}")
-            for ua, count in stats["user_agents"].most_common(5):
+            right_col.append(f"{c_sub}Top {min(self.top_uas,5)} User-Agents:{c_reset}")
+            for ua, count in stats["user_agents"].most_common(self.top_uas):
                 right_col.append(f"  - ({count}) {self._truncate_text(ua, 35)}")
 
-        def visible_len(s: str) -> int:
-            return len(re.sub(r"\033\[[0-9;]*m", "", s))
-
-        left_col_width = (
-            max((visible_len(line) for line in left_col), default=0)
-            if left_col
-            else 0
-        )
-
+        left_col_width = max((self._visible_len(line) for line in left_col), default=0) if left_col else 0
         for left, right in zip_longest(left_col, right_col, fillvalue=""):
-            pad = " " * max(0, (left_col_width - visible_len(left)))
+            pad = " " * max(0, (left_col_width - self._visible_len(left)))
             left_padded = f"{left}{pad}"
             add(f"{left_padded}  |  {right}")
 
@@ -413,9 +434,7 @@ class LogAnalyzer:
     def _render_list(self, stats):
         output = []
         add = output.append
-        c_head, c_sub, c_reset = (
-            ("\033[1;34m", "\033[1;36m", "\033[0m") if should_use_color() else ("", "", "")
-        )
+        c_head, c_sub, c_reset = (("\033[1;34m", "\033[1;36m", "\033[0m") if should_use_color() else ("", "", ""))
 
         add(f"\n{c_head}=== LOG STATISTICS (LIST VIEW) ==={c_reset}")
         add(f"Total lines: {stats.get('total_lines', 0):,}")
@@ -425,7 +444,7 @@ class LogAnalyzer:
         if stats.get("timestamps"):
             add(f"\n{c_head}Time Range:{c_reset}")
             add(f"  From: {stats['timestamps'][0]}")
-            add(f"  To: {stats['timestamps'][-1]}")
+            add(f"  To:   {stats['timestamps'][-1]}")
 
         add(f"\n{c_head}HTTP Status Codes:{c_reset}")
         if stats.get("http_status_codes"):
@@ -439,25 +458,25 @@ class LogAnalyzer:
             add("  (No data)")
 
         if stats.get("top_urls"):
-            add(f"\n{c_head}Top 5 Most Requested URLs:{c_reset}")
-            for url, count in stats["top_urls"].most_common(5):
+            add(f"\n{c_head}Top {self.top_urls} Most Requested URLs:{c_reset}")
+            for url, count in stats["top_urls"].most_common(self.top_urls):
                 add(f"  - ({count} times) {self._truncate_text(url)}")
 
         if stats.get("user_agents"):
-            add(f"\n{c_head}Top 5 User-Agents:{c_reset}")
-            for ua, count in stats["user_agents"].most_common(5):
+            add(f"\n{c_head}Top {self.top_uas} User-Agents:{c_reset}")
+            for ua, count in stats["user_agents"].most_common(self.top_uas):
                 add(f"  - ({count} times) {self._truncate_text(ua)}")
 
         if stats.get("suspicious_activity"):
             add(f"\n{c_head}Detected Security Alerts:{c_reset}")
-            for type, count in stats["suspicious_activity"].items():
-                add(f"  - Possible {type.replace('_', ' ')} attempts: {count} times")
+            for t, count in stats["suspicious_activity"].items():
+                add(f"  - Possible {t.replace('_', ' ')} attempts: {count} times")
 
         if stats.get("ips"):
-            add(f"\n{c_head}Top 10 IPs with Geolocation:{c_reset}")
+            add(f"\n{c_head}Top {self.top_ips} IPs with Geolocation:{c_reset}")
             add(f"{'COUNT':<7} {'IP':<18} {'COUNTRY'}")
             add(f"{'-----':<7} {'------------------':<18} {'------'}")
-            for ip, count in stats["ips"].most_common(10):
+            for ip, count in stats["ips"].most_common(self.top_ips):
                 country = self._get_country_for_ip(ip)
                 add(f"{count:<7} {ip:<18} {country}")
 
@@ -466,10 +485,13 @@ class LogAnalyzer:
     def _show_text_statistics(self, stats):
         render_func = self._render_list if self.list_view else self._render_columns
         for line in render_func(stats):
+            if self.sanitize_ansi:
+                line = ANSI_RE.sub("", line)
             print(line)
 
     def _prepare_json(self, stats):
         return {
+            "schema_version": SCHEMA_VERSION,
             "generated_at": datetime.utcnow().isoformat() + "Z",
             "summary": {
                 "file": self.log_file,
@@ -477,90 +499,149 @@ class LogAnalyzer:
                 "total_errors": stats.get("errors_count", 0),
                 "total_warnings": stats.get("warnings_count", 0),
                 "period": {
-                    "from": stats["timestamps"][0]
-                    if stats.get("timestamps")
-                    else None,
-                    "to": stats["timestamps"][-1]
-                    if stats.get("timestamps")
-                    else None,
+                    "from": stats["timestamps"][0] if stats.get("timestamps") else None,
+                    "to": stats["timestamps"][-1] if stats.get("timestamps") else None,
                 },
+            },
+            "parameters_used": {
+                "max_ips": self.max_ips,
+                "max_errors": self.max_errors,
+                "top_urls": self.top_urls,
+                "top_uas": self.top_uas,
+                "top_ips": self.top_ips,
             },
             "security_alerts": stats.get("suspicious_activity", {}),
             "http_methods": stats.get("http_methods", {}),
             "http_status_codes": stats.get("http_status_codes", {}),
-            "top_urls": stats.get("top_urls", Counter()).most_common(10),
-            "top_user_agents": stats.get("user_agents", Counter()).most_common(5),
+            "top_urls": stats.get("top_urls", Counter()).most_common(self.top_urls),
+            "top_user_agents": stats.get("user_agents", Counter()).most_common(self.top_uas),
             "top_errors": stats.get("specific_errors", Counter()).most_common(10),
             "top_ips": [
                 {"ip": ip, "count": count, "country": self._get_country_for_ip(ip)}
-                for ip, count in stats.get("ips", Counter()).most_common(20)
+                for ip, count in stats.get("ips", Counter()).most_common(self.top_ips)
             ],
         }
 
     def _show_json(self, stats):
         print(json.dumps(self._prepare_json(stats), indent=2, ensure_ascii=False))
 
-    def _save_results(self, data, output_file):
+    # --- Salida segura ---
+
+    def _ensure_safe_output_path(self, output_file, unsafe_output=False, force=False):
+        """
+        Protege contra usos maliciosos del tipo:
+          --output ../../../../../etc/loquesea  o  --output /etc/loquesea
+
+        Por defecto SOLO permite escribir dentro del cwd (o subdirectorios).
+        Se puede desactivar con --unsafe-output.
+        Evita seguir symlinks simples (comprobación básica).
+        """
+        out_path = os.path.abspath(output_file)
+        cwd = os.path.abspath(os.getcwd())
+
+        if not unsafe_output:
+            if not out_path.startswith(cwd + os.sep):
+                raise PermissionError(
+                    f"Refusing to write outside current working directory without --unsafe-output: {output_file}"
+                )
+
+        parent = os.path.dirname(out_path)
+        if not os.path.isdir(parent):
+            raise FileNotFoundError(f"Output directory does not exist: {parent}")
+
+        # Evitar symlinks triviales en el fichero a crear
+        if os.path.islink(out_path):
+            raise PermissionError(f"Refusing to write to symlink: {output_file}")
+
+        # Evitar symlinks en el directorio padre (defensa básica)
+        parts = parent.split(os.sep)
+        check = ""
+        for p in parts:
+            check = os.path.join(check, p) if check else (p if out_path.startswith(os.sep) else p)
+            if os.path.islink(check):
+                raise PermissionError(f"Refusing to write under symlinked directory: {check}")
+
+        if os.path.exists(out_path) and not force:
+            raise FileExistsError(f"Output file exists. Use --force to overwrite: {output_file}")
+
+        return out_path
+
+    def _save_results(self, data, output_file, unsafe_output=False, force=False):
         try:
-            with open(output_file, "w", encoding="utf-8") as f:
+            safe_path = self._ensure_safe_output_path(output_file, unsafe_output=unsafe_output, force=force)
+            # Al escribir a fichero, ya limpiamos colores si hay
+            if isinstance(data, dict) and "matches" in data:
                 if self.json_output:
-                    if isinstance(data, dict) and "matches" in data:
+                    with open(safe_path, "w", encoding="utf-8") as f:
                         json.dump(data, f, indent=2, ensure_ascii=False)
-                    else:
-                        json.dump(self._prepare_json(data), f, indent=2, ensure_ascii=False)
-                elif isinstance(data, dict) and "matches" in data:
-                    f.write(f"Pattern search: {data['pattern']}\n")
-                    f.write(f"Total matches: {data['total_found']}\n\n")
-                    for i, line in enumerate(data["matches"], 1):
-                        f.write(f"{i}: {line}\n")
                 else:
-                    render_func = (
-                        self._render_list if self.list_view else self._render_columns
-                    )
+                    with open(safe_path, "w", encoding="utf-8") as f:
+                        f.write(f"Pattern search: {data['pattern']}\n")
+                        f.write(f"Total matches: {data['total_found']}\n\n")
+                        for i, line in enumerate(data["matches"], 1):
+                            line_out = ANSI_RE.sub("", line)
+                            f.write(f"{i}: {line_out}\n")
+            else:
+                if self.json_output:
+                    with open(safe_path, "w", encoding="utf-8") as f:
+                        json.dump(self._prepare_json(data), f, indent=2, ensure_ascii=False)
+                else:
+                    render_func = self._render_list if self.list_view else self._render_columns
                     report_text = render_func(data)
-                    clean_report = [
-                        re.sub(r"\033\[[0-9;]*m", "", line) for line in report_text
-                    ]
-                    f.write("\n".join(clean_report))
+                    clean_report = [ANSI_RE.sub("", line) for line in report_text] if self.sanitize_ansi else report_text
+                    with open(safe_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(clean_report))
+
             c_ok, c_reset = ("\033[1;32m", "\033[0m") if should_use_color() else ("", "")
-            print(f"{c_ok}Results saved to: {output_file}{c_reset}")
+            print(f"{c_ok}Results saved to: {safe_path}{c_reset}")
         except Exception as e:
             self._handle_error({"error": f"Saving file: {e}"})
 
 
 def parse_date(date_str):
-    try:
-        return datetime.strptime(date_str, "%Y-%m-%d")
-    except ValueError:
+    """
+    Acepta YYYY-MM-DD o 'YYYY-MM-DD HH:MM:SS' y devuelve datetime naïve en UTC *interpretando la entrada como UTC*.
+    """
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S"):
         try:
-            return datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+            dt = datetime.strptime(date_str, fmt)
+            # Interpretamos que el usuario nos da UTC (naïve)
+            return dt
         except ValueError:
-            raise argparse.ArgumentTypeError(
-                f"Invalid date: '{date_str}'. Use YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'"
-            )
+            continue
+    raise argparse.ArgumentTypeError(f"Invalid date: '{date_str}'. Use YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Advanced log analyzer with memory optimization and geolocation.",
+        description="Advanced log analyzer with safe output, time filtering, and geolocation.",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog='''
 Example usage:
-  %(prog)s access.log                             # Full analysis (columns view)
-  %(prog)s access.log --list-view                 # Full analysis (list view)
-  %(prog)s error.log -p "Timeout" -c 50           # Search for timeouts
-  %(prog)s app.log --json --output result.json     # JSON output
-  %(prog)s access.log --since 2024-01-01 --until "2024-01-31 23:59:59" # Time filter
-  zcat access.log.gz | %(prog)s -                 # Read from stdin in a pipeline
+  %(prog)s access.log                                   # Full analysis (columns view)
+  %(prog)s access.log --list-view                       # Full analysis (list view)
+  %(prog)s error.log -p "Timeout" -c 50                 # Search for timeouts
+  %(prog)s app.log --json --output result.json          # JSON output
+  %(prog)s access.log --since 2024-01-01 --until "2024-01-31 23:59:59"  # Time filter
+  zcat access.log.gz | %(prog)s -                       # Read from stdin in a pipeline
+
+Security notes:
+  * --output is restricted to current working directory by default.
+  * Use --unsafe-output to allow writing outside CWD (use with care).
+  * Use --force to overwrite existing output files.
         ''',
     )
-    parser.add_argument(
-        "file", help="Log file to analyze (can be .gz or '-' for stdin)"
-    )
-    parser.add_argument("-p", "--pattern", help="Specific pattern to search for")
-    parser.add_argument("-c", "--count", type=int, default=10, help="Number of results to show")
+    parser.add_argument("file", help="Log file to analyze (can be .gz or '-' for stdin)")
+    parser.add_argument("-p", "--pattern", help="Specific pattern (regex) to search for")
+    parser.add_argument("-c", "--count", type=positive_int, default=10, help="Number of matched lines to show (pattern search)")
     parser.add_argument("--json", action="store_true", help="Show output in JSON format")
     parser.add_argument("--output", help="Output file to save results")
+    parser.add_argument("--force", action="store_true", help="Allow overwriting the output file if it exists")
+    parser.add_argument(
+        "--unsafe-output",
+        action="store_true",
+        help="Allow writing outside the current working directory (DANGEROUS: disables path confinement)",
+    )
     parser.add_argument(
         "--list-view",
         dest="list_view",
@@ -568,29 +649,30 @@ Example usage:
         help="Show results as a list instead of columns",
     )
     parser.add_argument(
-        "--since",
-        type=parse_date,
-        help="Filter logs from this date (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS')",
+        "--since", type=parse_date, help="Filter logs from this UTC date (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS')"
     )
     parser.add_argument(
-        "--until",
-        type=parse_date,
-        help="Filter logs up to this date (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS')",
+        "--until", type=parse_date, help="Filter logs up to this UTC date (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS')"
     )
-    parser.add_argument("--max-ips", type=int, help="Optional limit of unique IPs to track")
-    parser.add_argument(
-        "--max-errors", type=int, help="Optional limit of unique errors to track"
-    )
+    parser.add_argument("--max-ips", type=positive_int, help="Optional limit of unique IPs to track")
+    parser.add_argument("--max-errors", type=positive_int, help="Optional limit of unique errors to track")
     parser.add_argument("--geoip-db", help="Alternative path to GeoIP database")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging for debugging")
+    parser.add_argument("--no-sanitize-ansi", dest="sanitize_ansi", action="store_false",
+                        help="Do not sanitize ANSI escape codes in output")
+    parser.add_argument("--top-urls", type=positive_int, default=5, help="How many top URLs to display")
+    parser.add_argument("--top-uas", type=positive_int, default=5, help="How many top User-Agents to display")
+    parser.add_argument("--top-ips", type=positive_int, default=20, help="How many top IPs to display")
 
     args = parser.parse_args()
 
     if args.file != "-" and not os.path.isfile(args.file):
         c_err, c_reset = ("\033[1;31m", "\033[0m") if should_use_color() else ("", "")
-        print(
-            f"{c_err}Error: File '{args.file}' does not exist or is not a regular file.{c_reset}"
-        )
+        msg = f"Error: File '{args.file}' does not exist or is not a regular file."
+        if args.json:
+            print(json.dumps({"error": msg}, indent=2, ensure_ascii=False))
+        else:
+            print(f"{c_err}{msg}{c_reset}")
         sys.exit(1)
 
     analyzer = LogAnalyzer(
@@ -601,6 +683,10 @@ Example usage:
         max_errors=args.max_errors,
         verbose=args.verbose,
         list_view=args.list_view,
+        sanitize_ansi=args.sanitize_ansi,
+        top_urls=args.top_urls,
+        top_uas=args.top_uas,
+        top_ips=args.top_ips,
     )
 
     analyzer.analyze(
@@ -609,6 +695,8 @@ Example usage:
         since=args.since,
         until=args.until,
         output_file=args.output,
+        unsafe_output=args.unsafe_output,
+        force=args.force,
     )
 
 
