@@ -224,6 +224,11 @@ Periodo: De 2024-01-01 00:00:00 a 2024-01-31 23:59:59
   * JSON metrics: `truncated_lines`, `bytes_read`.
 
 ---
+Credits / Créditos — Architecture, integration and maintenance by Óscar Giménez Blasco. Drafting and refactoring assisted by generative AI tools; final design decisions, testing and operational safeguards by Óscar Giménez Blasco.
+
+CHANGELOG
+
+Added multithreading, hardened-regex option, input limits, safe-output confinement, and LRU cache. Benchmarked and stress-tested prior to release.
 
 ## 📜 License / Licencia
 
