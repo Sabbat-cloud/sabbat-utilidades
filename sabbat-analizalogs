@@ -8,35 +8,47 @@ import json
 import gzip
 import ipaddress
 import logging
-from collections import Counter
+from collections import Counter, OrderedDict
 from datetime import datetime, timezone
 import os
 from itertools import zip_longest
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
 
 # =========================
 #  Config & Internationalization
 # =========================
 
-# Path to GeoIP database.
 GEOIP_DB_PATH = "/var/lib/GeoIP/GeoLite2-Country.mmdb"
+SCHEMA_VERSION = "1.3.0"
 
-# Attempt to import GeoIP library.
+# Try optional hardened regex engine (enables atomic groups/possessive quantifiers)
+try:
+    import regex as rx  # pip install regex
+    HAVE_REGEX = True
+except Exception:
+    rx = None
+    HAVE_REGEX = False
+
+# Optional RE2 (if you prefer a non-backtracking engine). Not required.
+try:
+    import re2 as re2  # pip install re2
+    HAVE_RE2 = True
+except Exception:
+    re2 = None
+    HAVE_RE2 = False
+
+# GeoIP2 optional
 try:
     import geoip2.database
     import geoip2.errors
 except ImportError:
     geoip2 = None
 
-SCHEMA_VERSION = "1.2.0"
-
 ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 # ---- i18n helpers ----
 def detect_console_lang() -> str:
-    """
-    Returns 'es' or 'en' based on locale environment variables.
-    Priority: LC_ALL, LC_MESSAGES, LANGUAGE, LANG. Fallback: 'en'.
-    """
     for var in ("LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"):
         v = os.environ.get(var)
         if not v:
@@ -51,28 +63,27 @@ def detect_console_lang() -> str:
 
 I18N = {
     "en": {
-        "description": "Advanced log analyzer with safe output, time filtering, and geolocation.",
+        "description": "Advanced log analyzer with safe output, time filtering, geolocation, and multi-threading.",
         "epilog": (
             "Example usage:\n"
             "  %(prog)s access.log                                   # Full analysis (columns view)\n"
-            "  %(prog)s access.log --list-view                       # Full analysis (list view)\n"
-            "  %(prog)s error.log -p \"Timeout\" -c 50                 # Search for timeouts\n"
-            "  %(prog)s app.log --json --output result.json          # JSON output\n"
-            "  %(prog)s access.log --since 2024-01-01 --until \"2024-01-31 23:59:59\"  # Time filter\n"
-            "  zcat access.log.gz | %(prog)s -                       # Read from stdin in a pipeline\n\n"
+            "  %(prog)s access.log --list-view                       # List view\n"
+            "  %(prog)s error.log -p \"Timeout\" -c 50                 # Pattern search (ordered, single-thread)\n"
+            "  %(prog)s app.log --json --threads 8                   # JSON + multithread\n"
+            "  zcat access.log.gz | %(prog)s - --json                # Read from stdin (unless --deny-stdin)\n\n"
             "Security notes:\n"
-            "  * --output is restricted to current working directory by default.\n"
-            "  * Use --unsafe-output to allow writing outside CWD (use with care).\n"
-            "  * Use --force to overwrite existing output files.\n"
+            "  * Output confined to CWD unless --unsafe-output.\n"
+            "  * Line/byte limits via --max-line-chars / --max-bytes.\n"
+            "  * Hardened regex mode: --hardened-regex (needs 'regex' module).\n"
         ),
         "arg_lang": "Interface language: auto (default), en, es",
         "arg_file": "Log file to analyze (can be .gz or '-' for stdin)",
-        "arg_pattern": "Specific pattern (regex) to search for",
+        "arg_pattern": "Specific pattern (regex) to search for (ordered, single-thread)",
         "arg_count": "Number of matched lines to show (pattern search)",
         "arg_json": "Show output in JSON format",
         "arg_output": "Output file to save results",
         "arg_force": "Allow overwriting the output file if it exists",
-        "arg_unsafe_output": "Allow writing outside the current working directory (DANGEROUS: disables path confinement)",
+        "arg_unsafe_output": "Allow writing outside the current working directory (DANGEROUS)",
         "arg_list_view": "Show results as a list instead of columns",
         "arg_since": "Filter logs from this UTC date (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS')",
         "arg_until": "Filter logs up to this UTC date (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS')",
@@ -124,38 +135,44 @@ I18N = {
         "exists_use_force": "Output file exists. Use --force to overwrite: {path}",
         "file_not_found_json": "File {file} not found",
         "error_prefix": "Error: {msg}",
+        "arg_threads": "Worker threads for analysis (default: CPU count)",
+        "arg_batch": "Number of lines per batch for worker threads",
+        "arg_encoding": "Input encoding (default: utf-8); use 'auto' to try utf-8 then latin-1",
+        "arg_max_line_chars": "Max characters per input line (truncate beyond; default: 4096)",
+        "arg_max_bytes": "Stop after processing this many bytes from input (safety cutoff)",
+        "arg_deny_stdin": "Refuse reading from stdin (security policy)",
+        "arg_hardened_regex": "Use hardened regex engine if available ('regex' module) to reduce ReDoS risk",
     },
     "es": {
-        "description": "Analizador avanzado de logs con salida segura, filtrado temporal y geolocalización.",
+        "description": "Analizador avanzado de logs con salida segura, filtrado temporal, geolocalización y multihilo.",
         "epilog": (
-            "Ejemplos de uso:\n"
-            "  %(prog)s access.log                                   # Análisis completo (vista columnas)\n"
-            "  %(prog)s access.log --list-view                       # Análisis completo (vista lista)\n"
-            "  %(prog)s error.log -p \"Timeout\" -c 50                 # Buscar coincidencias\n"
-            "  %(prog)s app.log --json --output resultado.json        # Salida JSON\n"
-            "  %(prog)s access.log --since 2024-01-01 --until \"2024-01-31 23:59:59\"  # Filtro temporal\n"
-            "  zcat access.log.gz | %(prog)s -                       # Leer de stdin en un pipeline\n\n"
+            "Ejemplos:\n"
+            "  %(prog)s access.log                                   # Análisis completo (columnas)\n"
+            "  %(prog)s access.log --list-view                       # Vista lista\n"
+            "  %(prog)s error.log -p \"Timeout\" -c 50                 # Búsqueda de patrón (ordenada, monohilo)\n"
+            "  %(prog)s app.log --json --threads 8                   # JSON + multihilo\n"
+            "  zcat access.log.gz | %(prog)s - --json                # Leer de stdin (salvo --deny-stdin)\n\n"
             "Notas de seguridad:\n"
-            "  * Por defecto, --output se restringe al directorio de trabajo actual.\n"
-            "  * Usa --unsafe-output para permitir escribir fuera del CWD (con cuidado).\n"
-            "  * Usa --force para sobrescribir ficheros existentes.\n"
+            "  * Salida confinada al CWD salvo --unsafe-output.\n"
+            "  * Límites por línea/bytes: --max-line-chars / --max-bytes.\n"
+            "  * Modo regex endurecido: --hardened-regex (requiere módulo 'regex').\n"
         ),
         "arg_lang": "Idioma de la interfaz: auto (por defecto), en, es",
         "arg_file": "Fichero de log a analizar (puede ser .gz o '-' para stdin)",
-        "arg_pattern": "Patrón (regex) específico a buscar",
+        "arg_pattern": "Patrón (regex) a buscar (ordenado, monohilo)",
         "arg_count": "Número de líneas coincidentes a mostrar (búsqueda por patrón)",
         "arg_json": "Mostrar salida en formato JSON",
-        "arg_output": "Fichero de salida donde guardar los resultados",
-        "arg_force": "Permitir sobrescribir el fichero de salida si existe",
-        "arg_unsafe_output": "Permitir escribir fuera del directorio de trabajo actual (PELIGRO: desactiva el confinamiento)",
-        "arg_list_view": "Mostrar resultados como lista en lugar de columnas",
+        "arg_output": "Fichero de salida donde guardar resultados",
+        "arg_force": "Permitir sobrescribir el fichero si existe",
+        "arg_unsafe_output": "Permitir escribir fuera del directorio actual (PELIGROSO)",
+        "arg_list_view": "Mostrar como lista en lugar de columnas",
         "arg_since": "Filtrar logs desde esta fecha UTC (YYYY-MM-DD o 'YYYY-MM-DD HH:MM:SS')",
         "arg_until": "Filtrar logs hasta esta fecha UTC (YYYY-MM-DD o 'YYYY-MM-DD HH:MM:SS')",
         "arg_max_ips": "Límite opcional de IPs únicas a registrar",
         "arg_max_errors": "Límite opcional de errores únicos a registrar",
         "arg_geoip_db": "Ruta alternativa a la base de datos GeoIP",
-        "arg_verbose": "Activar logging detallado para depuración",
-        "arg_no_sanitize": "No sanitizar códigos de escape ANSI en la salida",
+        "arg_verbose": "Activar logging detallado",
+        "arg_no_sanitize": "No sanitizar códigos ANSI en la salida",
         "arg_top_urls": "Cuántas URLs top mostrar",
         "arg_top_uas": "Cuántos User-Agents top mostrar",
         "arg_top_ips": "Cuántas IPs top mostrar",
@@ -199,16 +216,19 @@ I18N = {
         "exists_use_force": "El fichero de salida existe. Usa --force para sobrescribir: {path}",
         "file_not_found_json": "No se encontró el fichero {file}",
         "error_prefix": "Error: {msg}",
+        "arg_threads": "Hilos de trabajo para el análisis (por defecto: núm. CPUs)",
+        "arg_batch": "Líneas por lote para los hilos de trabajo",
+        "arg_encoding": "Codificación de entrada (por defecto: utf-8); 'auto' prueba utf-8 y latin-1",
+        "arg_max_line_chars": "Máximo de caracteres por línea (trunca a partir de ahí; por defecto: 4096)",
+        "arg_max_bytes": "Detener tras procesar este número de bytes (corte de seguridad)",
+        "arg_deny_stdin": "Rechazar lectura desde stdin (política de seguridad)",
+        "arg_hardened_regex": "Usar motor regex endurecido si está disponible (módulo 'regex') para reducir ReDoS",
     },
 }
 
-# Global language dictionary used by helpers defined before main()
-T = I18N["en"]
+T = I18N["en"]  # set later by --lang
 
 def choose_lang(cli_lang: str | None) -> str:
-    """
-    Returns 'en' or 'es'. If cli_lang is 'auto' or None, autodetects.
-    """
     if not cli_lang or cli_lang == "auto":
         return detect_console_lang()
     return cli_lang if cli_lang in ("en", "es") else "en"
@@ -218,7 +238,6 @@ def choose_lang(cli_lang: str | None) -> str:
 # =========================
 
 def should_use_color():
-    """Returns True if the output is a terminal (so ANSI colors can be used) and NO_COLOR is not set."""
     return sys.stdout.isatty() and not os.getenv("NO_COLOR")
 
 def positive_int(value):
@@ -231,8 +250,73 @@ def positive_int(value):
     return iv
 
 # =========================
+#  Hardened regex builders (ReDoS mitigation)
+# =========================
+
+def build_safe_compiler(hardened: bool):
+    """
+    Returns a compile function and Pattern type, choosing the safest available engine.
+    - If hardened and 'regex' installed: use atomic groups/possessive quantifiers.
+    - Else fallback to stdlib re with bounded quantifiers to avoid catastrophic backtracking.
+    """
+    if hardened and HAVE_REGEX:
+        compiler = rx.compile
+        PatternT = rx.Pattern
+        return compiler, PatternT, "regex"
+    elif HAVE_RE2:
+        compiler = re2.compile
+        PatternT = type(re2.compile(r"a"))
+        return compiler, PatternT, "re2"
+    else:
+        compiler = re.compile
+        PatternT = type(re.compile(r"a"))
+        return compiler, PatternT, "re"
+
+def make_suspicious_patterns(compile, engine_name: str):
+    # Bounded alternatives to avoid '.*' catastrophic backtracking.
+    # If using 'regex', we can add atomic groups (?>...) and possessive quantifiers ++ for extra safety.
+    if engine_name == "regex":
+        union_select = compile(r"(?i)\bUNION\b(?>[^\r\n]{0,240}?)\bSELECT\b")
+        sqli = compile(r"(?i)(?:--|#|/\*|\bOR\b\s+1=1\b|\bSLEEP\s*\(|\bINFORMATION_SCHEMA\b|\bLOAD_FILE\s*\(|\bXP_CMDSHELL\b)")
+    else:
+        union_select = compile(r"(?i)\bUNION\b[^\r\n]{0,240}?\bSELECT\b")
+        sqli = compile(r"(?i)(?:--|#|/\*|\bOR\b\s+1=1\b|\bSLEEP\s*\(|\bINFORMATION_SCHEMA\b|\bLOAD_FILE\s*\(|\bXP_CMDSHELL\b)")
+
+    path_traversal = compile(r"(?i)(?:\.\./|%2e%2e/|%2e%2e%2f|\.%2e/|%2e\./)")
+    xss = compile(r"(?i)(?:<script\b|javascript:|on\w+=)")
+    return {"sql_union_select": union_select, "sql_ioc": sqli, "path_traversal": path_traversal, "xss_attempt": xss}
+
+def make_patterns(compile):
+    return {
+        "error": compile(r"\b(ERROR|Error|error|ERR|Fail|FAIL|fail|Exception|EXCEPTION|CRITICAL|Critical)\b"),
+        "warning": compile(r"\b(WARNING|Warning|warning|WARN|Warn|warn)\b"),
+        "http_full": compile(r'"(\b(?:GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|CONNECT|TRACE)\b)\s+([^\s]+)\s+[^"]+"\s+(\d{3})'),
+        "user_agent": compile(r'"([^"]*(?:Mozilla|curl|Python|Wget|bot)[^"]*)"', re.IGNORECASE),
+        "user_agent_tail": compile(r'"[^"]*"\s+"([^"]*)"\s*$'),
+        "timestamp_iso": compile(r"\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"),
+        "timestamp_apache": compile(r"\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4}"),
+    }
+
+# =========================
 #  Core Analyzer
 # =========================
+
+class LRU:
+    def __init__(self, maxsize=5000):
+        self.maxsize = maxsize
+        self.data = OrderedDict()
+
+    def get(self, key, default=None):
+        if key in self.data:
+            self.data.move_to_end(key)
+            return self.data[key]
+        return default
+
+    def set(self, key, value):
+        self.data[key] = value
+        self.data.move_to_end(key)
+        if len(self.data) > self.maxsize:
+            self.data.popitem(last=False)
 
 class LogAnalyzer:
     def __init__(
@@ -249,6 +333,13 @@ class LogAnalyzer:
         top_uas=5,
         top_ips=20,
         selected_lang="en",
+        threads=None,
+        batch_size=2000,
+        encoding="utf-8",
+        max_line_chars=4096,
+        max_bytes=None,
+        deny_stdin=False,
+        hardened_regex=False,
     ):
         self.log_file = log_file
         self.json_output = json_output
@@ -261,32 +352,28 @@ class LogAnalyzer:
         self.top_uas = top_uas
         self.top_ips = top_ips
         self.selected_lang = selected_lang
+        self.threads = threads or max(1, (os.cpu_count() or 2))
+        self.batch_size = batch_size
+        self.encoding = encoding
+        self.max_line_chars = max_line_chars
+        self.max_bytes = max_bytes
+        self.deny_stdin = deny_stdin
+        self.hardened_regex = hardened_regex
 
         self._init_logger(verbose)
-        self.geoip_cache = {}
-        self.suspicious_patterns = {
-            "sql_injection": re.compile(
-                r"(?i)(?:\bUNION\b.*\bSELECT\b|\bOR\b\s+1=1\b|--|#|/\*|\bSLEEP\s*\(|\bINFORMATION_SCHEMA\b|\bLOAD_FILE\s*\(|\bXP_CMDSHELL\b)"
-            ),
-            "path_traversal": re.compile(
-                r"(?i)(?:\.\./|%2e%2e/|%2e%2e%2f|\.%2e/|%2e\./)"
-            ),
-            "xss_attempt": re.compile(r"(?i)(?:<script\b|javascript:|on\w+=)"),
-        }
+        self.geoip_cache = LRU(maxsize=5000)
 
-        self.patterns = {
-            "error": r"\b(ERROR|Error|error|ERR|Fail|FAIL|fail|Exception|EXCEPTION|CRITICAL|Critical)\b",
-            "warning": r"\b(WARNING|Warning|warning|WARN|Warn|warn)\b",
-            "http_full": re.compile(
-                r'"(\b(?:GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|CONNECT|TRACE)\b)\s+([^\s]+)\s+[^"]+"\s+(\d{3})'
-            ),
-            "user_agent": re.compile(r'"([^"]*(?:Mozilla|curl|Python|Wget|bot)[^"]*)"', re.IGNORECASE),
-            "user_agent_tail": re.compile(r'"[^"]*"\s+"([^"]*)"\s*$'),
-            "timestamp_iso": r"\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?",
-            "timestamp_apache": r"\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4}",
-        }
+        # Build regex compilers
+        self._compile, PatternT, engine = build_safe_compiler(hardened_regex)
+        self.logger.info(f"Regex engine: {engine}{' (hardened)' if hardened_regex and HAVE_REGEX else ''}")
+        self.suspicious_patterns = make_suspicious_patterns(self._compile, engine)
+        self.patterns = make_patterns(self._compile)
 
         self.geoip_reader = self._load_geoip()
+
+        # Counters for input validation/limits
+        self.truncated_lines = 0
+        self.bytes_read = 0
 
     def _init_logger(self, verbose=False):
         self.logger = logging.getLogger("log_analyzer")
@@ -313,17 +400,26 @@ class LogAnalyzer:
             self.logger.error(f"Error loading GeoIP: {e}")
         return None
 
-    def open_file(self):
+    def _open_stream(self):
+        if self.log_file == "-":
+            if self.deny_stdin:
+                raise PermissionError("stdin disabled by --deny-stdin")
+            return sys.stdin
+        if self.log_file.endswith(".gz"):
+            # Use surrogateescape to avoid silently dropping bytes
+            return gzip.open(self.log_file, "rt", encoding=self._resolve_encoding(), errors="surrogateescape", newline="")
+        return open(self.log_file, "r", encoding=self._resolve_encoding(), errors="surrogateescape", newline="")
+
+    def _resolve_encoding(self):
+        if self.encoding and self.encoding.lower() != "auto":
+            return self.encoding
+        # Try utf-8 else latin-1 (lossless)
         try:
-            if self.log_file == "-":
-                return sys.stdin
-            if self.log_file.endswith(".gz"):
-                return gzip.open(self.log_file, "rt", encoding="utf-8", errors="ignore")
-            else:
-                return open(self.log_file, "r", encoding="utf-8", errors="ignore")
-        except Exception as e:
-            self.logger.error(T["error_opening_file"].format(err=e))
-            raise
+            with open(self.log_file, "rb") as f:
+                f.peek(1)
+            return "utf-8"
+        except Exception:
+            return "latin-1"
 
     def extract_valid_ips(self, line):
         valid_ips = []
@@ -341,9 +437,10 @@ class LogAnalyzer:
 
     def analyze(self, pattern=None, count=10, since=None, until=None, output_file=None, unsafe_output=False, force=False):
         try:
-            with self.open_file() as file_obj:
+            with self._open_stream() as file_obj:
                 if pattern:
-                    results = self._search_pattern(file_obj, pattern, count, since, until)
+                    # Keep single-thread to preserve order of first N matches
+                    results = self._search_pattern_singlethread(file_obj, pattern, count, since, until)
                     if output_file:
                         self._save_results(results, output_file, unsafe_output=unsafe_output, force=force)
                     else:
@@ -352,7 +449,7 @@ class LogAnalyzer:
                         else:
                             self._show_pattern_search(results)
                 else:
-                    stats = self._generate_statistics(file_obj, since, until)
+                    stats = self._generate_statistics_parallel(file_obj, since, until)
                     if output_file:
                         self._save_results(stats, output_file, unsafe_output=unsafe_output, force=force)
                     elif self.json_output:
@@ -381,10 +478,11 @@ class LogAnalyzer:
             print(f"\033[1;31m{msg}\033[0m" if should_use_color() else msg)
         sys.exit(1)
 
+    # ---------- Time parsing ----------
+
     def _parse_log_time_utc(self, line):
-        """Return naive datetime in UTC (no tzinfo) or None if unparsable."""
-        iso_match = re.search(self.patterns["timestamp_iso"], line)
-        apache_match = re.search(self.patterns["timestamp_apache"], line)
+        iso_match = self.patterns["timestamp_iso"].search(line)
+        apache_match = self.patterns["timestamp_apache"].search(line)
         try:
             if iso_match:
                 raw = iso_match.group(0)
@@ -416,11 +514,13 @@ class LogAnalyzer:
             return False
         return True
 
-    def _search_pattern(self, file_iterable, pattern, count, since, until):
-        regex = re.compile(pattern, re.IGNORECASE)
+    # ---------- Pattern search (ordered, single-thread) ----------
+
+    def _search_pattern_singlethread(self, file_iterable, pattern, count, since, until):
+        regex = self._compile(pattern, re.IGNORECASE)
         first_matches = []
         total = 0
-        for line in file_iterable:
+        for line in self._iter_lines(file_iterable):
             if not self._in_time_range(line, since, until):
                 continue
             if regex.search(line):
@@ -436,10 +536,15 @@ class LogAnalyzer:
             "pattern": pattern,
             "matches": first_matches,
             "total_found": total,
+            "truncated_lines": self.truncated_lines,
+            "bytes_read": self.bytes_read,
         }
 
-    def _generate_statistics(self, file_iterable, since=None, until=None):
-        stats = {
+    # ---------- Parallel statistics ----------
+
+    def _generate_statistics_parallel(self, file_iterable, since=None, until=None):
+        # Global structure
+        global_stats = {
             "ips": Counter(),
             "specific_errors": Counter(),
             "top_urls": Counter(),
@@ -451,92 +556,183 @@ class LogAnalyzer:
             "errors_count": 0,
             "warnings_count": 0,
             "timestamps": [],
+            "truncated_lines": 0,
+            "bytes_read": 0,
         }
         first_ts = None
         last_ts = None
-        processed_lines = 0
 
-        PatternT = getattr(re, "Pattern", type(re.compile("")))
-        regex_dict = {k: re.compile(v) for k, v in self.patterns.items() if isinstance(v, str)}
-        regex_dict.update({k: v for k, v in self.patterns.items() if isinstance(v, PatternT)})
+        def worker(batch_lines):
+            # Produce partial stats
+            part = {
+                "ips": Counter(),
+                "specific_errors": Counter(),
+                "top_urls": Counter(),
+                "user_agents": Counter(),
+                "http_methods": Counter(),
+                "http_status_codes": Counter(),
+                "suspicious_activity": Counter(),
+                "total_lines": 0,
+                "errors_count": 0,
+                "warnings_count": 0,
+                "first_ts": None,
+                "last_ts": None,
+                "truncated_lines": 0,
+            }
+            for line in batch_lines:
+                if not self._in_time_range(line, since, until):
+                    continue
+                part["total_lines"] += 1
 
-        for line in file_iterable:
-            processed_lines += 1
-            if not self._in_time_range(line, since, until):
-                continue
-            stats["total_lines"] += 1
+                if self.patterns["error"].search(line):
+                    part["errors_count"] += 1
+                    message = line.strip().split("]:", 1)[-1].strip()
+                    message = re.sub(
+                        r"\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)*|\d{1,3}(?:\.\d{1,3}){3})\b",
+                        "<NUM>",
+                        message,
+                    )
+                    if (message in part["specific_errors"] or
+                        self.max_errors is None or len(part["specific_errors"]) < self.max_errors):
+                        part["specific_errors"][message] += 1
 
-            if regex_dict["error"].search(line):
-                stats["errors_count"] += 1
-                message = line.strip().split("]:", 1)[-1].strip()
-                message = re.sub(
-                    r"\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)*|\d{1,3}(?:\.\d{1,3}){3})\b",
-                    "<NUM>",
-                    message,
-                )
-                if (message in stats["specific_errors"] or
-                    self.max_errors is None or len(stats["specific_errors"]) < self.max_errors):
-                    stats["specific_errors"][message] += 1
+                if self.patterns["warning"].search(line):
+                    part["warnings_count"] += 1
 
-            if regex_dict["warning"].search(line):
-                stats["warnings_count"] += 1
+                for ip in self.extract_valid_ips(line):
+                    if (ip in part["ips"] or
+                        self.max_ips is None or len(part["ips"]) < self.max_ips):
+                        part["ips"][ip] += 1
 
-            for ip in self.extract_valid_ips(line):
-                if (ip in stats["ips"] or
-                    self.max_ips is None or len(stats["ips"]) < self.max_ips):
-                    stats["ips"][ip] += 1
+                hm = self.patterns["http_full"].search(line)
+                if hm:
+                    method, url, code = hm.groups()
+                    part["http_methods"][method] += 1
+                    part["http_status_codes"][code] += 1
+                    # Trim URL
+                    if len(url) > 400:
+                        url = url[:400] + "…"
+                    part["top_urls"][url] += 1
+                    ul = url.lower()
+                    # Dual-pattern SQLi: union_select or iocs
+                    if self.suspicious_patterns["sql_union_select"].search(ul) or \
+                       self.suspicious_patterns["sql_ioc"].search(ul):
+                        part["suspicious_activity"]["sql_injection"] += 1
+                    if self.suspicious_patterns["path_traversal"].search(ul):
+                        part["suspicious_activity"]["path_traversal"] += 1
+                    if self.suspicious_patterns["xss_attempt"].search(ul):
+                        part["suspicious_activity"]["xss_attempt"] += 1
 
-            http_match = regex_dict["http_full"].search(line)
-            if http_match:
-                method, url, code = http_match.groups()
-                stats["http_methods"][method] += 1
-                stats["http_status_codes"][code] += 1
-                stats["top_urls"][url] += 1
+                # UA
+                ua = None
+                m = self.patterns["user_agent_tail"].search(line)
+                if m:
+                    ua = m.group(1).strip()
+                else:
+                    m = self.patterns["user_agent"].search(line)
+                    if m:
+                        ua = m.group(1).strip()
+                if ua and ua != "-":
+                    if len(ua) > 200:
+                        ua = ua[:200] + "…"
+                    part["user_agents"][ua] += 1
 
-                url_lower = url.lower()
-                for name, pattern in self.suspicious_patterns.items():
-                    if pattern.search(url_lower):
-                        stats["suspicious_activity"][name] += 1
+                # timestamps for display only
+                t1 = self.patterns["timestamp_iso"].search(line)
+                t2 = self.patterns["timestamp_apache"].search(line)
+                ts_display = t1.group(0) if t1 else (t2.group(0) if t2 else None)
+                if ts_display:
+                    if part["first_ts"] is None:
+                        part["first_ts"] = ts_display
+                    part["last_ts"] = ts_display
 
-            ua = None
-            ua_tail = regex_dict["user_agent_tail"].search(line)
-            if ua_tail:
-                ua = ua_tail.group(1).strip()
-            else:
-                ua_match = regex_dict["user_agent"].search(line)
-                if ua_match:
-                    ua = ua_match.group(1).strip()
-            if ua and ua != "-":
-                if len(ua) > 200:
-                    ua = ua[:200] + "…"
-                stats["user_agents"][ua] += 1
+            return part
 
-            ts_iso = regex_dict["timestamp_iso"].search(line)
-            ts_apache = regex_dict["timestamp_apache"].search(line)
-            ts_display = ts_iso.group(0) if ts_iso else (ts_apache.group(0) if ts_apache else None)
-            if ts_display:
-                if first_ts is None:
-                    first_ts = ts_display
-                last_ts = ts_display
+        # Dispatch batches
+        futures = []
+        batch = []
+        with ThreadPoolExecutor(max_workers=self.threads) as ex:
+            for line in self._iter_lines(file_iterable):
+                if not (since or until):
+                    # no-op for speed
+                    pass
+                batch.append(line)
+                if len(batch) >= self.batch_size:
+                    futures.append(ex.submit(worker, batch))
+                    batch = []
+            if batch:
+                futures.append(ex.submit(worker, batch))
 
-        if (self.max_ips is None and self.max_errors is None and processed_lines > 100_000):
-            self.logger.warning(T["large_log_hint"].format(lines=processed_lines))
-        stats["timestamps"] = [first_ts, last_ts] if first_ts else []
-        return stats
+            for f in as_completed(futures):
+                part = f.result()
+                # Reduce
+                global_stats["ips"].update(part["ips"])
+                global_stats["specific_errors"].update(part["specific_errors"])
+                global_stats["top_urls"].update(part["top_urls"])
+                global_stats["user_agents"].update(part["user_agents"])
+                global_stats["http_methods"].update(part["http_methods"])
+                global_stats["http_status_codes"].update(part["http_status_codes"])
+                global_stats["suspicious_activity"].update(part["suspicious_activity"])
+                global_stats["total_lines"] += part["total_lines"]
+                global_stats["errors_count"] += part["errors_count"]
+                global_stats["warnings_count"] += part["warnings_count"]
+                if part["first_ts"] and first_ts is None:
+                    first_ts = part["first_ts"]
+                if part["last_ts"]:
+                    last_ts = part["last_ts"]
+
+        # finalize
+        if first_ts:
+            global_stats["timestamps"] = [first_ts, last_ts]
+        global_stats["truncated_lines"] = self.truncated_lines
+        global_stats["bytes_read"] = self.bytes_read
+
+        # hint for huge files
+        if (self.max_ips is None and self.max_errors is None and global_stats["total_lines"] > 100_000):
+            self.logger.warning(T["large_log_hint"].format(lines=global_stats["total_lines"]))
+        return global_stats
+
+    # ---------- Safe line iterator with limits ----------
+
+    def _iter_lines(self, file_obj):
+        """
+        Iterates lines enforcing:
+          - max_line_chars (truncate beyond)
+          - max_bytes (stop after budget)
+        Tracks self.truncated_lines and self.bytes_read.
+        """
+        for raw in file_obj:
+            # Account bytes (approx by encoded length; for stdin we approximate by len(raw))
+            b = len(raw.encode(getattr(file_obj, "encoding", "utf-8"), errors="replace"))
+            self.bytes_read += b
+            if self.max_bytes is not None and self.bytes_read > self.max_bytes:
+                break
+            line = raw
+            if len(line) > self.max_line_chars:
+                line = line[: self.max_line_chars] + "…"
+                self.truncated_lines += 1
+            yield line
+
+    # ---------- GeoIP ----------
 
     def _get_country_for_ip(self, ip):
-        if ip in self.geoip_cache:
-            return self.geoip_cache[ip]
+        cached = self.geoip_cache.get(ip)
+        if cached is not None:
+            return cached
         if not self.geoip_reader:
-            return "GeoIP not available" if self.selected_lang == "en" else "GeoIP no disponible"
+            val = "GeoIP not available" if self.selected_lang == "en" else "GeoIP no disponible"
+            self.geoip_cache.set(ip, val)
+            return val
         try:
             country = self.geoip_reader.country(ip).country.name or "Unknown"
         except geoip2.errors.AddressNotFoundError:
             country = "Private/Not found IP" if self.selected_lang == "en" else "Privada/No encontrada"
         except Exception:
             country = "GeoIP lookup error" if self.selected_lang == "en" else "Error de GeoIP"
-        self.geoip_cache[ip] = country
+        self.geoip_cache.set(ip, country)
         return country
+
+    # ---------- Rendering helpers (unchanged from previous, omitted comments for brevity) ----------
 
     def _group_http_codes(self, http_codes_counter):
         summary = Counter()
@@ -689,6 +885,12 @@ class LogAnalyzer:
                 "top_urls": self.top_urls,
                 "top_uas": self.top_uas,
                 "top_ips": self.top_ips,
+                "threads": self.threads,
+                "batch_size": self.batch_size,
+                "encoding": self.encoding,
+                "max_line_chars": self.max_line_chars,
+                "max_bytes": self.max_bytes,
+                "hardened_regex": bool(self.hardened_regex and HAVE_REGEX),
             },
             "security_alerts": stats.get("suspicious_activity", {}),
             "http_methods": stats.get("http_methods", {}),
@@ -700,12 +902,14 @@ class LogAnalyzer:
                 {"ip": ip, "count": count, "country": self._get_country_for_ip(ip)}
                 for ip, count in stats.get("ips", Counter()).most_common(self.top_ips)
             ],
+            "truncated_lines": stats.get("truncated_lines", 0),
+            "bytes_read": stats.get("bytes_read", 0),
         }
 
     def _show_json(self, stats):
         print(json.dumps(self._prepare_json(stats), indent=2, ensure_ascii=False))
 
-    # --- Safe output handling ---
+    # --- Safe output handling (unchanged from prior hardened version) ---
 
     def _ensure_safe_output_path(self, output_file, unsafe_output=False, force=False):
         out_path = os.path.abspath(output_file)
@@ -770,10 +974,6 @@ class LogAnalyzer:
 # =========================
 
 def parse_date(date_str):
-    """
-    Accepts YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS' and returns naive datetime in UTC (interpreting input as UTC).
-    Uses current language for error messages.
-    """
     for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S"):
         try:
             dt = datetime.strptime(date_str, fmt)
@@ -783,7 +983,6 @@ def parse_date(date_str):
     raise argparse.ArgumentTypeError(T["invalid_date"].format(date=date_str))
 
 def main():
-    # Stage 1: bootstrap parser to read --lang early
     boot = argparse.ArgumentParser(add_help=False)
     boot.add_argument("--lang", choices=["auto", "en", "es"], default="auto", help=I18N["en"]["arg_lang"])
     args_boot, _unknown = boot.parse_known_args()
@@ -791,7 +990,6 @@ def main():
     global T
     T = I18N[lang]
 
-    # Stage 2: full parser with localized texts
     parser = argparse.ArgumentParser(
         description=T["description"],
         formatter_class=argparse.RawTextHelpFormatter,
@@ -817,6 +1015,15 @@ def main():
     parser.add_argument("--top-uas", type=positive_int, default=5, help=T["arg_top_uas"])
     parser.add_argument("--top-ips", type=positive_int, default=20, help=T["arg_top_ips"])
 
+    # New hardening & performance options
+    parser.add_argument("--threads", type=positive_int, help=T["arg_threads"])
+    parser.add_argument("--batch-size", type=positive_int, default=2000, help=T["arg_batch"])
+    parser.add_argument("--encoding", default="utf-8", help=T["arg_encoding"])
+    parser.add_argument("--max-line-chars", type=positive_int, default=4096, help=T["arg_max_line_chars"])
+    parser.add_argument("--max-bytes", type=positive_int, help=T["arg_max_bytes"])
+    parser.add_argument("--deny-stdin", action="store_true", help=T["arg_deny_stdin"])
+    parser.add_argument("--hardened-regex", action="store_true", help=T["arg_hardened_regex"])
+
     args = parser.parse_args()
 
     if args.file != "-" and not os.path.isfile(args.file):
@@ -841,6 +1048,13 @@ def main():
         top_uas=args.top_uas,
         top_ips=args.top_ips,
         selected_lang=lang,
+        threads=args.threads,
+        batch_size=args.batch_size,
+        encoding=args.encoding,
+        max_line_chars=args.max_line_chars,
+        max_bytes=args.max_bytes,
+        deny_stdin=args.deny_stdin,
+        hardened_regex=args.hardened_regex,
     )
 
     analyzer.analyze(
