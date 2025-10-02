@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import re
+import argparse
+import sys
+import json
+import gzip
+import ipaddress
+import logging
+from collections import Counter
+from datetime import datetime
+import os
+from itertools import zip_longest
+
+# Path to GeoIP database.
+GEOIP_DB_PATH = "/var/lib/GeoIP/GeoLite2-Country.mmdb"
+
+# Attempt to import GeoIP library.
+try:
+    import geoip2.database
+    import geoip2.errors
+except ImportError:
+    geoip2 = None
+
+
+def should_use_color():
+    """Returns True if the output is a terminal (so ANSI colors can be used) and NO_COLOR is not set."""
+    return sys.stdout.isatty() and not os.getenv("NO_COLOR")
+
+
+class LogAnalyzer:
+    def __init__(
+        self,
+        log_file,
+        json_output=False,
+        geoip_db_path=None,
+        max_ips=None,
+        max_errors=None,
+        verbose=False,
+        list_view=False,
+    ):
+        self.log_file = log_file
+        self.json_output = json_output
+        self.max_ips = max_ips
+        self.max_errors = max_errors
+        self.geoip_db_path = geoip_db_path or GEOIP_DB_PATH
+        self.list_view = list_view
+
+        self._init_logger(verbose)
+        self.geoip_cache = {}
+        self.suspicious_patterns = {
+            "sql_injection": re.compile(
+                r"(?i)(?:\bUNION\b.+\bSELECT\b|\bSELECT\b|\bINSERT\b|\bDROP\b|\bDELETE\b|%27|--\s|/*|\bSLEEP\(|INFORMATION_SCHEMA)"
+            ),
+            "path_traversal": re.compile(r"(\.\./|\.\.\|%2e%2e/)", re.IGNORECASE),
+            "xss_attempt": re.compile(r"(?i)(?:<script\b|javascript:|on\w+=)")
+        }
+
+        self.patterns = {
+            "error": r"\b(ERROR|Error|error|ERR|Fail|FAIL|fail|Exception|EXCEPTION|CRITICAL|Critical)\b",
+            "warning": r"\b(WARNING|Warning|warning|WARN|Warn|warn)\b",
+            "http_full": re.compile(
+                r'"(\b(?:GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|CONNECT|TRACE)\b)\s+([^\s]+)\s+[^"]+"\s+(\d{3})'
+            ),
+            "user_agent": re.compile(r'"([^"]*(?:Mozilla|curl|Python|Wget|bot)[^"]*)"', re.IGNORECASE),
+            "user_agent_tail": re.compile(r'"[^"]*"\s+"([^"]*)"\s*$'),
+            "timestamp_iso": r"\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?",
+            "timestamp_apache": r"\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4}",
+        }
+
+        self.geoip_reader = self._load_geoip()
+
+    def _init_logger(self, verbose=False):
+        self.logger = logging.getLogger("log_analyzer")
+        self.logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+        if not self.logger.handlers:
+            h = logging.StreamHandler(sys.stderr)
+            h.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+            self.logger.addHandler(h)
+
+    def _load_geoip(self):
+        if not geoip2:
+            self.logger.warning(
+                "geoip2 module not installed. Geolocation is disabled."
+            )
+            return None
+        try:
+            reader = geoip2.database.Reader(self.geoip_db_path)
+            self.logger.info(f"GeoIP database loaded from {self.geoip_db_path}")
+            return reader
+        except FileNotFoundError:
+            msg = f"Warning: GeoIP database not found at {self.geoip_db_path}."
+            if not self.json_output:
+                print(f"\033[1;33m{msg}\033[0m" if should_use_color() else msg)
+            self.logger.warning(msg)
+        except Exception as e:
+            self.logger.error(f"Error loading GeoIP: {e}")
+        return None
+
+    def open_file(self):
+        try:
+            if self.log_file == "-":
+                # Allow stdin for pipelines
+                return sys.stdin
+            if self.log_file.endswith(".gz"):
+                return gzip.open(
+                    self.log_file, "rt", encoding="utf-8", errors="ignore"
+                )
+            else:
+                return open(self.log_file, "r", encoding="utf-8", errors="ignore")
+        except Exception as e:
+            self.logger.error(f"Error opening file: {e}")
+            raise
+
+    def extract_valid_ips(self, line):
+        valid_ips = []
+        possible_ips = re.split(r"[\s,;'\"()\[\]]+", line)
+        for candidate in possible_ips:
+            if not candidate:
+                continue
+            try:
+                ip_obj = ipaddress.ip_address(candidate)
+                if getattr(ip_obj, "is_global", False):
+                    valid_ips.append(str(ip_obj))
+            except ValueError:
+                continue
+        return valid_ips
+
+    def analyze(
+        self, pattern=None, count=10, since=None, until=None, output_file=None
+    ):
+        try:
+            with self.open_file() as file_obj:
+                if pattern:
+                    results = self._search_pattern(file_obj, pattern, count, since, until)
+                    if output_file:
+                        self._save_results(results, output_file)
+                    else:
+                        if self.json_output:
+                            print(json.dumps(results, indent=2, ensure_ascii=False))
+                        else:
+                            self._show_pattern_search(results)
+                else:
+                    stats = self._generate_statistics(file_obj, since, until)
+                    if output_file:
+                        self._save_results(stats, output_file)
+                    elif self.json_output:
+                        self._show_json(stats)
+                    else:
+                        self._show_text_statistics(stats)
+        except FileNotFoundError:
+            self._handle_error({"error": f"File {self.log_file} not found"})
+        except Exception as e:
+            self.logger.error("Analysis error", exc_info=True)
+            self._handle_error({"error": f"Error analyzing file: {e}"})
+        finally:
+            try:
+                if self.geoip_reader:
+                    self.geoip_reader.close()
+            except Exception:
+                pass
+
+    def _handle_error(self, error_msg):
+        if self.json_output:
+            print(json.dumps(error_msg, indent=4, ensure_ascii=False))
+        else:
+            msg = f"Error: {error_msg['error']}"
+            print(f"\033[1;31m{msg}\033[0m" if should_use_color() else msg)
+        sys.exit(1)
+
+    def _in_time_range(self, line, since, until):
+        if not (since or until):
+            return True
+        iso_match = re.search(self.patterns["timestamp_iso"], line)
+        apache_match = re.search(self.patterns["timestamp_apache"], line)
+        log_time = None
+        try:
+            if iso_match:
+                log_time_str_full = iso_match.group(0).replace("T", " ")
+                log_time_str = re.sub(r"\.\d+", "", log_time_str_full)
+                log_time = datetime.strptime(log_time_str, "%Y-%m-%d %H:%M:%S")
+            elif apache_match:
+                log_time_str = apache_match.group(0)
+                log_time = (
+                    datetime.strptime(log_time_str, "%d/%b/%Y:%H:%M:%S %z").replace(tzinfo=None)
+                )
+        except ValueError as e:
+            self.logger.debug(f"Could not parse timestamp: {e}")
+            return True
+        if log_time is None:
+            return True
+        if since and log_time < since:
+            return False
+        if until and log_time > until:
+            return False
+        return True
+
+    def _search_pattern(self, file_iterable, pattern, count, since, until):
+        regex = re.compile(pattern, re.IGNORECASE)
+        first_matches = []
+        total = 0
+        for line in file_iterable:
+            if not self._in_time_range(line, since, until):
+                continue
+            if regex.search(line):
+                total += 1
+                if len(first_matches) < count:
+                    first_matches.append(line.strip())
+        return {
+            "pattern": pattern,
+            "matches": first_matches,
+            "total_found": total,
+        }
+
+    def _show_pattern_search(self, results):
+        c_prefix, c_reset = ("\033[1;32m", "\033[0m") if should_use_color() else ("", "")
+        print(f"\n{c_prefix}Searching for matches of '{results['pattern']}':{c_reset}")
+        print(
+            f"Showing {len(results['matches'])} of {results['total_found']} matches:\n"
+        )
+        for i, line in enumerate(results["matches"], 1):
+            print(f"{i}: {line}")
+
+    def _generate_statistics(self, file_iterable, since=None, until=None):
+        stats = Counter()
+        stats.update(
+            {
+                k: Counter()
+                for k in [
+                    "ips",
+                    "specific_errors",
+                    "top_urls",
+                    "user_agents",
+                    "http_methods",
+                    "http_status_codes",
+                    "suspicious_activity",
+                ]
+            }
+        )
+        timestamps = []
+        processed_lines = 0
+
+        PatternT = getattr(re, "Pattern", type(re.compile("")))
+        regex_dict = {k: re.compile(v) for k, v in self.patterns.items() if isinstance(v, str)}
+        regex_dict.update({k: v for k, v in self.patterns.items() if isinstance(v, PatternT)})
+
+        for line in file_iterable:
+            processed_lines += 1
+            if not self._in_time_range(line, since, until):
+                continue
+            stats["total_lines"] += 1
+
+            if regex_dict["error"].search(line):
+                stats["errors_count"] += 1
+                message = line.strip().split("]:", 1)[-1].strip()
+                message = re.sub(
+                    r"\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)*|\d{1,3}(?:\.\d{1,3}){3})\b",
+                    "<NUM>",
+                    message,
+                )
+                if self.max_errors is None or len(stats["specific_errors"]) < self.max_errors:
+                    stats["specific_errors"][message] += 1
+
+            if regex_dict["warning"].search(line):
+                stats["warnings_count"] += 1
+
+            for ip in self.extract_valid_ips(line):
+                if self.max_ips is None or len(stats["ips"]) < self.max_ips:
+                    stats["ips"][ip] += 1
+
+            http_match = regex_dict["http_full"].search(line)
+            if http_match:
+                method, url, code = http_match.groups()
+                stats["http_methods"][method] += 1
+                stats["http_status_codes"][code] += 1
+                stats["top_urls"][url] += 1
+                if ("?" in url or "=" in url or "%" in url):
+                    for name, pattern in self.suspicious_patterns.items():
+                        if pattern.search(url):
+                            stats["suspicious_activity"][name] += 1
+
+            ua = None
+            ua_tail = regex_dict["user_agent_tail"].search(line)
+            if ua_tail:
+                ua = ua_tail.group(1).strip()
+            else:
+                ua_match = regex_dict["user_agent"].search(line)
+                if ua_match:
+                    ua = ua_match.group(1).strip()
+            if ua and ua != "-":
+                stats["user_agents"][ua] += 1
+
+            ts_iso = regex_dict["timestamp_iso"].search(line)
+            ts_apache = regex_dict["timestamp_apache"].search(line)
+            if ts_iso:
+                timestamps.append(ts_iso.group(0))
+            elif ts_apache:
+                timestamps.append(ts_apache.group(0))
+
+        if (
+            self.max_ips is None
+            and self.max_errors is None
+            and processed_lines > 100_000
+        ):
+            self.logger.warning(
+                f"Large log file ({processed_lines:,} lines). Consider using --max-ips or --max-errors."
+            )
+        stats["timestamps"] = [timestamps[0], timestamps[-1]] if timestamps else []
+        return stats
+
+    def _get_country_for_ip(self, ip):
+        if ip in self.geoip_cache:
+            return self.geoip_cache[ip]
+        if not self.geoip_reader:
+            return "GeoIP not available"
+        try:
+            country = self.geoip_reader.country(ip).country.name or "Unknown"
+        except geoip2.errors.AddressNotFoundError:
+            country = "Private/Not found IP"
+        except Exception:
+            country = "GeoIP lookup error"
+        self.geoip_cache[ip] = country
+        return country
+
+    def _group_http_codes(self, http_codes_counter):
+        summary = Counter()
+        for code_str, count in http_codes_counter.items():
+            try:
+                summary[f"{int(code_str) // 100}xx"] += count
+            except (ValueError, TypeError):
+                summary["Others"] += count
+        return summary
+
+    def _truncate_text(self, text, length=40):
+        return text[:length] + "..." if len(text) > length else text
+
+    def _render_columns(self, stats):
+        output = []
+        add = output.append
+        c_head, c_sub, c_reset = (
+            ("\033[1;34m", "\033[1;36m", "\033[0m") if should_use_color() else ("", "", "")
+        )
+
+        add(f"\n{c_head}=== LOG STATISTICS ==={c_reset}")
+        add(f"Total lines: {stats.get('total_lines', 0):,}")
+        add(
+            f"Errors: {stats.get('errors_count', 0)} | Warnings: {stats.get('warnings_count', 0)}"
+        )
+        if stats.get("timestamps"):
+            add(f"Period: From {stats['timestamps'][0]} to {stats['timestamps'][-1]}")
+
+        if stats.get("suspicious_activity"):
+            add(f"\n{c_head}Detected Security Alerts:{c_reset}")
+            alerts = [
+                f"{type.replace('_', ' ').title()} ({count})"
+                for type, count in stats["suspicious_activity"].items()
+            ]
+            add(" | ".join(alerts))
+
+        add(f"\n{'-'*80}")
+
+        left_col, right_col = [], []
+
+        left_col.append(f"{c_sub}HTTP Status Codes:{c_reset}")
+        if stats.get("http_status_codes"):
+            for code, count in stats["http_status_codes"].most_common(5):
+                left_col.append(f"  - Code {code}: {count} times")
+            summary = self._group_http_codes(stats["http_status_codes"])
+            left_col.append(f"  {c_sub}Summary by range:{c_reset}")
+            for range_code, count in sorted(summary.items()):
+                left_col.append(f"    - {range_code}: {count} requests")
+        else:
+            left_col.append("  (No data)")
+
+        if stats.get("top_urls"):
+            left_col.append("")
+            left_col.append(f"{c_sub}Top 5 Requested URLs:{c_reset}")
+            for url, count in stats["top_urls"].most_common(5):
+                left_col.append(f"  - ({count}) {self._truncate_text(url, 35)}")
+
+        if stats.get("ips"):
+            right_col.append(f"{c_sub}Top 10 IPs with Geolocation:{c_reset}")
+            right_col.append(f"{'COUNT':<7} {'IP':<18} {'COUNTRY'}")
+            right_col.append(f"{'-----':<7} {'------------------':<18} {'------'}")
+            for ip, count in stats["ips"].most_common(10):
+                country = self._get_country_for_ip(ip)
+                right_col.append(
+                    f"{count:<7} {ip:<18} {self._truncate_text(country, 15)}"
+                )
+        if stats.get("user_agents"):
+            right_col.append("")
+            right_col.append(f"{c_sub}Top 5 User-Agents:{c_reset}")
+            for ua, count in stats["user_agents"].most_common(5):
+                right_col.append(f"  - ({count}) {self._truncate_text(ua, 35)}")
+
+        def visible_len(s: str) -> int:
+            return len(re.sub(r"\033\[[0-9;]*m", "", s))
+
+        left_col_width = (
+            max((visible_len(line) for line in left_col), default=0)
+            if left_col
+            else 0
+        )
+
+        for left, right in zip_longest(left_col, right_col, fillvalue=""):
+            pad = " " * max(0, (left_col_width - visible_len(left)))
+            left_padded = f"{left}{pad}"
+            add(f"{left_padded}  |  {right}")
+
+        return output
+
+    def _render_list(self, stats):
+        output = []
+        add = output.append
+        c_head, c_sub, c_reset = (
+            ("\033[1;34m", "\033[1;36m", "\033[0m") if should_use_color() else ("", "", "")
+        )
+
+        add(f"\n{c_head}=== LOG STATISTICS (LIST VIEW) ==={c_reset}")
+        add(f"Total lines: {stats.get('total_lines', 0):,}")
+        add(f"Errors: {stats.get('errors_count', 0)}")
+        add(f"Warnings: {stats.get('warnings_count', 0)}")
+
+        if stats.get("timestamps"):
+            add(f"\n{c_head}Time Range:{c_reset}")
+            add(f"  From: {stats['timestamps'][0]}")
+            add(f"  To: {stats['timestamps'][-1]}")
+
+        add(f"\n{c_head}HTTP Status Codes:{c_reset}")
+        if stats.get("http_status_codes"):
+            for code, count in stats["http_status_codes"].most_common():
+                add(f"  - Code {code}: {count} times")
+            summary = self._group_http_codes(stats["http_status_codes"])
+            add(f"\n  {c_sub}Summary by range:{c_reset}")
+            for range_code, count in sorted(summary.items()):
+                add(f"    - {range_code}: {count} requests")
+        else:
+            add("  (No data)")
+
+        if stats.get("top_urls"):
+            add(f"\n{c_head}Top 5 Most Requested URLs:{c_reset}")
+            for url, count in stats["top_urls"].most_common(5):
+                add(f"  - ({count} times) {self._truncate_text(url)}")
+
+        if stats.get("user_agents"):
+            add(f"\n{c_head}Top 5 User-Agents:{c_reset}")
+            for ua, count in stats["user_agents"].most_common(5):
+                add(f"  - ({count} times) {self._truncate_text(ua)}")
+
+        if stats.get("suspicious_activity"):
+            add(f"\n{c_head}Detected Security Alerts:{c_reset}")
+            for type, count in stats["suspicious_activity"].items():
+                add(f"  - Possible {type.replace('_', ' ')} attempts: {count} times")
+
+        if stats.get("ips"):
+            add(f"\n{c_head}Top 10 IPs with Geolocation:{c_reset}")
+            add(f"{'COUNT':<7} {'IP':<18} {'COUNTRY'}")
+            add(f"{'-----':<7} {'------------------':<18} {'------'}")
+            for ip, count in stats["ips"].most_common(10):
+                country = self._get_country_for_ip(ip)
+                add(f"{count:<7} {ip:<18} {country}")
+
+        return output
+
+    def _show_text_statistics(self, stats):
+        render_func = self._render_list if self.list_view else self._render_columns
+        for line in render_func(stats):
+            print(line)
+
+    def _prepare_json(self, stats):
+        return {
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "summary": {
+                "file": self.log_file,
+                "total_lines": stats.get("total_lines", 0),
+                "total_errors": stats.get("errors_count", 0),
+                "total_warnings": stats.get("warnings_count", 0),
+                "period": {
+                    "from": stats["timestamps"][0]
+                    if stats.get("timestamps")
+                    else None,
+                    "to": stats["timestamps"][-1]
+                    if stats.get("timestamps")
+                    else None,
+                },
+            },
+            "security_alerts": stats.get("suspicious_activity", {}),
+            "http_methods": stats.get("http_methods", {}),
+            "http_status_codes": stats.get("http_status_codes", {}),
+            "top_urls": stats.get("top_urls", Counter()).most_common(10),
+            "top_user_agents": stats.get("user_agents", Counter()).most_common(5),
+            "top_errors": stats.get("specific_errors", Counter()).most_common(10),
+            "top_ips": [
+                {"ip": ip, "count": count, "country": self._get_country_for_ip(ip)}
+                for ip, count in stats.get("ips", Counter()).most_common(20)
+            ],
+        }
+
+    def _show_json(self, stats):
+        print(json.dumps(self._prepare_json(stats), indent=2, ensure_ascii=False))
+
+    def _save_results(self, data, output_file):
+        try:
+            with open(output_file, "w", encoding="utf-8") as f:
+                if self.json_output:
+                    if isinstance(data, dict) and "matches" in data:
+                        json.dump(data, f, indent=2, ensure_ascii=False)
+                    else:
+                        json.dump(self._prepare_json(data), f, indent=2, ensure_ascii=False)
+                elif isinstance(data, dict) and "matches" in data:
+                    f.write(f"Pattern search: {data['pattern']}\n")
+                    f.write(f"Total matches: {data['total_found']}\n\n")
+                    for i, line in enumerate(data["matches"], 1):
+                        f.write(f"{i}: {line}\n")
+                else:
+                    render_func = (
+                        self._render_list if self.list_view else self._render_columns
+                    )
+                    report_text = render_func(data)
+                    clean_report = [
+                        re.sub(r"\033\[[0-9;]*m", "", line) for line in report_text
+                    ]
+                    f.write("\n".join(clean_report))
+            c_ok, c_reset = ("\033[1;32m", "\033[0m") if should_use_color() else ("", "")
+            print(f"{c_ok}Results saved to: {output_file}{c_reset}")
+        except Exception as e:
+            self._handle_error({"error": f"Saving file: {e}"})
+
+
+def parse_date(date_str):
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        try:
+            return datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"Invalid date: '{date_str}'. Use YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'"
+            )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Advanced log analyzer with memory optimization and geolocation.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog='''
+Example usage:
+  %(prog)s access.log                             # Full analysis (columns view)
+  %(prog)s access.log --list-view                 # Full analysis (list view)
+  %(prog)s error.log -p "Timeout" -c 50           # Search for timeouts
+  %(prog)s app.log --json --output result.json     # JSON output
+  %(prog)s access.log --since 2024-01-01 --until "2024-01-31 23:59:59" # Time filter
+  zcat access.log.gz | %(prog)s -                 # Read from stdin in a pipeline
+        ''',
+    )
+    parser.add_argument(
+        "file", help="Log file to analyze (can be .gz or '-' for stdin)"
+    )
+    parser.add_argument("-p", "--pattern", help="Specific pattern to search for")
+    parser.add_argument("-c", "--count", type=int, default=10, help="Number of results to show")
+    parser.add_argument("--json", action="store_true", help="Show output in JSON format")
+    parser.add_argument("--output", help="Output file to save results")
+    parser.add_argument(
+        "--list-view",
+        dest="list_view",
+        action="store_true",
+        help="Show results as a list instead of columns",
+    )
+    parser.add_argument(
+        "--since",
+        type=parse_date,
+        help="Filter logs from this date (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS')",
+    )
+    parser.add_argument(
+        "--until",
+        type=parse_date,
+        help="Filter logs up to this date (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS')",
+    )
+    parser.add_argument("--max-ips", type=int, help="Optional limit of unique IPs to track")
+    parser.add_argument(
+        "--max-errors", type=int, help="Optional limit of unique errors to track"
+    )
+    parser.add_argument("--geoip-db", help="Alternative path to GeoIP database")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging for debugging")
+
+    args = parser.parse_args()
+
+    if args.file != "-" and not os.path.isfile(args.file):
+        c_err, c_reset = ("\033[1;31m", "\033[0m") if should_use_color() else ("", "")
+        print(
+            f"{c_err}Error: File '{args.file}' does not exist or is not a regular file.{c_reset}"
+        )
+        sys.exit(1)
+
+    analyzer = LogAnalyzer(
+        args.file,
+        json_output=args.json,
+        geoip_db_path=args.geoip_db,
+        max_ips=args.max_ips,
+        max_errors=args.max_errors,
+        verbose=args.verbose,
+        list_view=args.list_view,
+    )
+
+    analyzer.analyze(
+        pattern=args.pattern,
+        count=args.count,
+        since=args.since,
+        until=args.until,
+        output_file=args.output,
+    )
+
+
+if __name__ == "__main__":
+    main()
