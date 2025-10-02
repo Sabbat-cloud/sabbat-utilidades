@@ -13,6 +13,10 @@ from datetime import datetime, timezone
 import os
 from itertools import zip_longest
 
+# =========================
+#  Config & Internationalization
+# =========================
+
 # Path to GeoIP database.
 GEOIP_DB_PATH = "/var/lib/GeoIP/GeoLite2-Country.mmdb"
 
@@ -23,26 +27,212 @@ try:
 except ImportError:
     geoip2 = None
 
-
-SCHEMA_VERSION = "1.1.0"
+SCHEMA_VERSION = "1.2.0"
 
 ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
+# ---- i18n helpers ----
+def detect_console_lang() -> str:
+    """
+    Returns 'es' or 'en' based on locale environment variables.
+    Priority: LC_ALL, LC_MESSAGES, LANGUAGE, LANG. Fallback: 'en'.
+    """
+    for var in ("LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"):
+        v = os.environ.get(var)
+        if not v:
+            continue
+        first = v.split(":")[0]
+        code = first.split(".")[0].lower()
+        if code.startswith("es"):
+            return "es"
+        if code.startswith("en"):
+            return "en"
+    return "en"
+
+I18N = {
+    "en": {
+        "description": "Advanced log analyzer with safe output, time filtering, and geolocation.",
+        "epilog": (
+            "Example usage:\n"
+            "  %(prog)s access.log                                   # Full analysis (columns view)\n"
+            "  %(prog)s access.log --list-view                       # Full analysis (list view)\n"
+            "  %(prog)s error.log -p \"Timeout\" -c 50                 # Search for timeouts\n"
+            "  %(prog)s app.log --json --output result.json          # JSON output\n"
+            "  %(prog)s access.log --since 2024-01-01 --until \"2024-01-31 23:59:59\"  # Time filter\n"
+            "  zcat access.log.gz | %(prog)s -                       # Read from stdin in a pipeline\n\n"
+            "Security notes:\n"
+            "  * --output is restricted to current working directory by default.\n"
+            "  * Use --unsafe-output to allow writing outside CWD (use with care).\n"
+            "  * Use --force to overwrite existing output files.\n"
+        ),
+        "arg_lang": "Interface language: auto (default), en, es",
+        "arg_file": "Log file to analyze (can be .gz or '-' for stdin)",
+        "arg_pattern": "Specific pattern (regex) to search for",
+        "arg_count": "Number of matched lines to show (pattern search)",
+        "arg_json": "Show output in JSON format",
+        "arg_output": "Output file to save results",
+        "arg_force": "Allow overwriting the output file if it exists",
+        "arg_unsafe_output": "Allow writing outside the current working directory (DANGEROUS: disables path confinement)",
+        "arg_list_view": "Show results as a list instead of columns",
+        "arg_since": "Filter logs from this UTC date (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS')",
+        "arg_until": "Filter logs up to this UTC date (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS')",
+        "arg_max_ips": "Optional limit of unique IPs to track",
+        "arg_max_errors": "Optional limit of unique errors to track",
+        "arg_geoip_db": "Alternative path to GeoIP database",
+        "arg_verbose": "Enable verbose logging for debugging",
+        "arg_no_sanitize": "Do not sanitize ANSI escape codes in output",
+        "arg_top_urls": "How many top URLs to display",
+        "arg_top_uas": "How many top User-Agents to display",
+        "arg_top_ips": "How many top IPs to display",
+        "bad_file": "Error: File '{file}' does not exist or is not a regular file.",
+        "invalid_date": "Invalid date: '{date}'. Use YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'",
+        "invalid_int": "Value must be > 0 (got {val})",
+        "invalid_int_value": "Invalid int value: {val}",
+        "geoip_not_installed": "geoip2 module not installed. Geolocation is disabled.",
+        "geoip_loaded": "GeoIP database loaded from {path}",
+        "geoip_not_found": "Warning: GeoIP database not found at {path}.",
+        "error_opening_file": "Error opening file: {err}",
+        "analysis_error": "Error analyzing file: {err}",
+        "saving_file_error": "Saving file: {err}",
+        "results_saved": "Results saved to: {path}",
+        "large_log_hint": "Large log file ({lines:,} lines). Consider using --max-ips or --max-errors.",
+        "searching_for": "Searching for matches of '{pattern}':",
+        "showing_matches": "Showing {shown} of {total} matches:",
+        "log_stats": "=== LOG STATISTICS ===",
+        "log_stats_list": "=== LOG STATISTICS (LIST VIEW) ===",
+        "total_lines": "Total lines: {n:,}",
+        "errors_warnings": "Errors: {e} | Warnings: {w}",
+        "period": "Period: From {start} to {end}",
+        "time_range": "Time Range:",
+        "from": "  From: {start}",
+        "to": "  To:   {end}",
+        "detected_alerts": "Detected Security Alerts:",
+        "http_status_codes": "HTTP Status Codes:",
+        "summary_by_range": "Summary by range:",
+        "no_data": "  (No data)",
+        "top_urls": "Top {n} Requested URLs:",
+        "top_uas": "Top {n} User-Agents:",
+        "top_ips": "Top {n} IPs with Geolocation:",
+        "count_hdr": "COUNT",
+        "ip_hdr": "IP",
+        "country_hdr": "COUNTRY",
+        "possible": "  - Possible {t} attempts: {c} times",
+        "confined_refuse": "Refusing to write outside current working directory without --unsafe-output: {path}",
+        "no_dir": "Output directory does not exist: {path}",
+        "symlink_file": "Refusing to write to symlink: {path}",
+        "symlink_dir": "Refusing to write under symlinked directory: {path}",
+        "exists_use_force": "Output file exists. Use --force to overwrite: {path}",
+        "file_not_found_json": "File {file} not found",
+        "error_prefix": "Error: {msg}",
+    },
+    "es": {
+        "description": "Analizador avanzado de logs con salida segura, filtrado temporal y geolocalización.",
+        "epilog": (
+            "Ejemplos de uso:\n"
+            "  %(prog)s access.log                                   # Análisis completo (vista columnas)\n"
+            "  %(prog)s access.log --list-view                       # Análisis completo (vista lista)\n"
+            "  %(prog)s error.log -p \"Timeout\" -c 50                 # Buscar coincidencias\n"
+            "  %(prog)s app.log --json --output resultado.json        # Salida JSON\n"
+            "  %(prog)s access.log --since 2024-01-01 --until \"2024-01-31 23:59:59\"  # Filtro temporal\n"
+            "  zcat access.log.gz | %(prog)s -                       # Leer de stdin en un pipeline\n\n"
+            "Notas de seguridad:\n"
+            "  * Por defecto, --output se restringe al directorio de trabajo actual.\n"
+            "  * Usa --unsafe-output para permitir escribir fuera del CWD (con cuidado).\n"
+            "  * Usa --force para sobrescribir ficheros existentes.\n"
+        ),
+        "arg_lang": "Idioma de la interfaz: auto (por defecto), en, es",
+        "arg_file": "Fichero de log a analizar (puede ser .gz o '-' para stdin)",
+        "arg_pattern": "Patrón (regex) específico a buscar",
+        "arg_count": "Número de líneas coincidentes a mostrar (búsqueda por patrón)",
+        "arg_json": "Mostrar salida en formato JSON",
+        "arg_output": "Fichero de salida donde guardar los resultados",
+        "arg_force": "Permitir sobrescribir el fichero de salida si existe",
+        "arg_unsafe_output": "Permitir escribir fuera del directorio de trabajo actual (PELIGRO: desactiva el confinamiento)",
+        "arg_list_view": "Mostrar resultados como lista en lugar de columnas",
+        "arg_since": "Filtrar logs desde esta fecha UTC (YYYY-MM-DD o 'YYYY-MM-DD HH:MM:SS')",
+        "arg_until": "Filtrar logs hasta esta fecha UTC (YYYY-MM-DD o 'YYYY-MM-DD HH:MM:SS')",
+        "arg_max_ips": "Límite opcional de IPs únicas a registrar",
+        "arg_max_errors": "Límite opcional de errores únicos a registrar",
+        "arg_geoip_db": "Ruta alternativa a la base de datos GeoIP",
+        "arg_verbose": "Activar logging detallado para depuración",
+        "arg_no_sanitize": "No sanitizar códigos de escape ANSI en la salida",
+        "arg_top_urls": "Cuántas URLs top mostrar",
+        "arg_top_uas": "Cuántos User-Agents top mostrar",
+        "arg_top_ips": "Cuántas IPs top mostrar",
+        "bad_file": "Error: El fichero '{file}' no existe o no es un fichero regular.",
+        "invalid_date": "Fecha no válida: '{date}'. Usa YYYY-MM-DD o 'YYYY-MM-DD HH:MM:SS'",
+        "invalid_int": "El valor debe ser > 0 (recibido {val})",
+        "invalid_int_value": "Valor entero no válido: {val}",
+        "geoip_not_installed": "El módulo geoip2 no está instalado. Geolocalización deshabilitada.",
+        "geoip_loaded": "Base GeoIP cargada desde {path}",
+        "geoip_not_found": "Aviso: No se encontró la base GeoIP en {path}.",
+        "error_opening_file": "Error abriendo el fichero: {err}",
+        "analysis_error": "Error analizando el fichero: {err}",
+        "saving_file_error": "Error guardando el fichero: {err}",
+        "results_saved": "Resultados guardados en: {path}",
+        "large_log_hint": "Fichero grande ({lines:,} líneas). Considera usar --max-ips o --max-errors.",
+        "searching_for": "Buscando coincidencias de '{pattern}':",
+        "showing_matches": "Mostrando {shown} de {total} coincidencias:",
+        "log_stats": "=== ESTADÍSTICAS DEL LOG ===",
+        "log_stats_list": "=== ESTADÍSTICAS DEL LOG (VISTA LISTA) ===",
+        "total_lines": "Líneas totales: {n:,}",
+        "errors_warnings": "Errores: {e} | Avisos: {w}",
+        "period": "Periodo: De {start} a {end}",
+        "time_range": "Rango temporal:",
+        "from": "  Desde: {start}",
+        "to": "  Hasta: {end}",
+        "detected_alerts": "Alertas de seguridad detectadas:",
+        "http_status_codes": "Códigos de estado HTTP:",
+        "summary_by_range": "Resumen por rangos:",
+        "no_data": "  (Sin datos)",
+        "top_urls": "Top {n} URLs solicitadas:",
+        "top_uas": "Top {n} User-Agents:",
+        "top_ips": "Top {n} IPs con geolocalización:",
+        "count_hdr": "CUENTA",
+        "ip_hdr": "IP",
+        "country_hdr": "PAÍS",
+        "possible": "  - Posibles intentos de {t}: {c} veces",
+        "confined_refuse": "Se rechaza escribir fuera del directorio actual sin --unsafe-output: {path}",
+        "no_dir": "El directorio de salida no existe: {path}",
+        "symlink_file": "Se rechaza escribir en un symlink: {path}",
+        "symlink_dir": "Se rechaza escribir bajo un directorio symlink: {path}",
+        "exists_use_force": "El fichero de salida existe. Usa --force para sobrescribir: {path}",
+        "file_not_found_json": "No se encontró el fichero {file}",
+        "error_prefix": "Error: {msg}",
+    },
+}
+
+# Global language dictionary used by helpers defined before main()
+T = I18N["en"]
+
+def choose_lang(cli_lang: str | None) -> str:
+    """
+    Returns 'en' or 'es'. If cli_lang is 'auto' or None, autodetects.
+    """
+    if not cli_lang or cli_lang == "auto":
+        return detect_console_lang()
+    return cli_lang if cli_lang in ("en", "es") else "en"
+
+# =========================
+#  Utilities
+# =========================
 
 def should_use_color():
     """Returns True if the output is a terminal (so ANSI colors can be used) and NO_COLOR is not set."""
     return sys.stdout.isatty() and not os.getenv("NO_COLOR")
 
-
 def positive_int(value):
     try:
         iv = int(value)
     except Exception:
-        raise argparse.ArgumentTypeError(f"Invalid int value: {value}")
+        raise argparse.ArgumentTypeError(T["invalid_int_value"].format(val=value))
     if iv <= 0:
-        raise argparse.ArgumentTypeError(f"Value must be > 0 (got {iv})")
+        raise argparse.ArgumentTypeError(T["invalid_int"].format(val=iv))
     return iv
 
+# =========================
+#  Core Analyzer
+# =========================
 
 class LogAnalyzer:
     def __init__(
@@ -58,6 +248,7 @@ class LogAnalyzer:
         top_urls=5,
         top_uas=5,
         top_ips=20,
+        selected_lang="en",
     ):
         self.log_file = log_file
         self.json_output = json_output
@@ -69,15 +260,14 @@ class LogAnalyzer:
         self.top_urls = top_urls
         self.top_uas = top_uas
         self.top_ips = top_ips
+        self.selected_lang = selected_lang
 
         self._init_logger(verbose)
         self.geoip_cache = {}
         self.suspicious_patterns = {
-            # Endurecidas y sin rama vacía
             "sql_injection": re.compile(
                 r"(?i)(?:\bUNION\b.*\bSELECT\b|\bOR\b\s+1=1\b|--|#|/\*|\bSLEEP\s*\(|\bINFORMATION_SCHEMA\b|\bLOAD_FILE\s*\(|\bXP_CMDSHELL\b)"
             ),
-            # Se corrige el typo y se añade codificación común
             "path_traversal": re.compile(
                 r"(?i)(?:\.\./|%2e%2e/|%2e%2e%2f|\.%2e/|%2e\./)"
             ),
@@ -108,14 +298,14 @@ class LogAnalyzer:
 
     def _load_geoip(self):
         if not geoip2:
-            self.logger.warning("geoip2 module not installed. Geolocation is disabled.")
+            self.logger.warning(T["geoip_not_installed"])
             return None
         try:
             reader = geoip2.database.Reader(self.geoip_db_path)
-            self.logger.info(f"GeoIP database loaded from {self.geoip_db_path}")
+            self.logger.info(T["geoip_loaded"].format(path=self.geoip_db_path))
             return reader
         except FileNotFoundError:
-            msg = f"Warning: GeoIP database not found at {self.geoip_db_path}."
+            msg = T["geoip_not_found"].format(path=self.geoip_db_path)
             if not self.json_output:
                 print(f"\033[1;33m{msg}\033[0m" if should_use_color() else msg)
             self.logger.warning(msg)
@@ -126,14 +316,13 @@ class LogAnalyzer:
     def open_file(self):
         try:
             if self.log_file == "-":
-                # Allow stdin for pipelines
                 return sys.stdin
             if self.log_file.endswith(".gz"):
                 return gzip.open(self.log_file, "rt", encoding="utf-8", errors="ignore")
             else:
                 return open(self.log_file, "r", encoding="utf-8", errors="ignore")
         except Exception as e:
-            self.logger.error(f"Error opening file: {e}")
+            self.logger.error(T["error_opening_file"].format(err=e))
             raise
 
     def extract_valid_ips(self, line):
@@ -144,7 +333,6 @@ class LogAnalyzer:
                 continue
             try:
                 ip_obj = ipaddress.ip_address(candidate)
-                # Solo IPs globales enrutable (excluye privadas/reservadas)
                 if getattr(ip_obj, "is_global", False):
                     valid_ips.append(str(ip_obj))
             except ValueError:
@@ -172,10 +360,10 @@ class LogAnalyzer:
                     else:
                         self._show_text_statistics(stats)
         except FileNotFoundError:
-            self._handle_error({"error": f"File {self.log_file} not found"})
+            self._handle_error({"error": T["file_not_found_json"].format(file=self.log_file)})
         except Exception as e:
             self.logger.error("Analysis error", exc_info=True)
-            self._handle_error({"error": f"Error analyzing file: {e}"})
+            self._handle_error({"error": T["analysis_error"].format(err=e)})
         finally:
             try:
                 if self.geoip_reader:
@@ -187,23 +375,21 @@ class LogAnalyzer:
         if self.json_output:
             print(json.dumps(error_msg, indent=4, ensure_ascii=False))
         else:
-            msg = f"Error: {error_msg['error']}"
+            msg = T["error_prefix"].format(msg=error_msg.get("error", ""))
             if self.sanitize_ansi:
                 msg = ANSI_RE.sub("", msg)
             print(f"\033[1;31m{msg}\033[0m" if should_use_color() else msg)
         sys.exit(1)
 
     def _parse_log_time_utc(self, line):
-        """Devuelve datetime naïve en UTC (sin tzinfo) o None si no se puede parsear."""
+        """Return naive datetime in UTC (no tzinfo) or None if unparsable."""
         iso_match = re.search(self.patterns["timestamp_iso"], line)
         apache_match = re.search(self.patterns["timestamp_apache"], line)
         try:
             if iso_match:
                 raw = iso_match.group(0)
-                # datetime.fromisoformat no soporta 'Z' directo en Python<3.11; normalizamos
                 if raw.endswith("Z"):
                     raw = raw[:-1] + "+00:00"
-                # quitar fracciones para homogeneizar
                 raw_clean = re.sub(r"\.\d+", "", raw)
                 dt = datetime.fromisoformat(raw_clean)
                 if dt.tzinfo is not None:
@@ -246,6 +432,7 @@ class LogAnalyzer:
                     first_matches.append(line_out)
         return {
             "schema_version": SCHEMA_VERSION,
+            "lang": self.selected_lang,
             "pattern": pattern,
             "matches": first_matches,
             "total_found": total,
@@ -263,7 +450,6 @@ class LogAnalyzer:
             "total_lines": 0,
             "errors_count": 0,
             "warnings_count": 0,
-            # guardaremos solo primera y última marca tal cual aparecen
             "timestamps": [],
         }
         first_ts = None
@@ -288,7 +474,6 @@ class LogAnalyzer:
                     "<NUM>",
                     message,
                 )
-                # límites sin sesgo: si ya existe, siempre incrementa
                 if (message in stats["specific_errors"] or
                     self.max_errors is None or len(stats["specific_errors"]) < self.max_errors):
                     stats["specific_errors"][message] += 1
@@ -308,13 +493,11 @@ class LogAnalyzer:
                 stats["http_status_codes"][code] += 1
                 stats["top_urls"][url] += 1
 
-                # Analizar SIEMPRE por si la ruta lleva payload sospechoso
                 url_lower = url.lower()
                 for name, pattern in self.suspicious_patterns.items():
                     if pattern.search(url_lower):
                         stats["suspicious_activity"][name] += 1
 
-            # User-Agent heurística
             ua = None
             ua_tail = regex_dict["user_agent_tail"].search(line)
             if ua_tail:
@@ -328,7 +511,6 @@ class LogAnalyzer:
                     ua = ua[:200] + "…"
                 stats["user_agents"][ua] += 1
 
-            # timestamps mostrados (no en UTC, sino tal y como aparecen)
             ts_iso = regex_dict["timestamp_iso"].search(line)
             ts_apache = regex_dict["timestamp_apache"].search(line)
             ts_display = ts_iso.group(0) if ts_iso else (ts_apache.group(0) if ts_apache else None)
@@ -338,9 +520,7 @@ class LogAnalyzer:
                 last_ts = ts_display
 
         if (self.max_ips is None and self.max_errors is None and processed_lines > 100_000):
-            self.logger.warning(
-                f"Large log file ({processed_lines:,} lines). Consider using --max-ips or --max-errors."
-            )
+            self.logger.warning(T["large_log_hint"].format(lines=processed_lines))
         stats["timestamps"] = [first_ts, last_ts] if first_ts else []
         return stats
 
@@ -348,13 +528,13 @@ class LogAnalyzer:
         if ip in self.geoip_cache:
             return self.geoip_cache[ip]
         if not self.geoip_reader:
-            return "GeoIP not available"
+            return "GeoIP not available" if self.selected_lang == "en" else "GeoIP no disponible"
         try:
             country = self.geoip_reader.country(ip).country.name or "Unknown"
         except geoip2.errors.AddressNotFoundError:
-            country = "Private/Not found IP"
+            country = "Private/Not found IP" if self.selected_lang == "en" else "Privada/No encontrada"
         except Exception:
-            country = "GeoIP lookup error"
+            country = "GeoIP lookup error" if self.selected_lang == "en" else "Error de GeoIP"
         self.geoip_cache[ip] = country
         return country
 
@@ -378,14 +558,14 @@ class LogAnalyzer:
         add = output.append
         c_head, c_sub, c_reset = (("\033[1;34m", "\033[1;36m", "\033[0m") if should_use_color() else ("", "", ""))
 
-        add(f"\n{c_head}=== LOG STATISTICS ==={c_reset}")
-        add(f"Total lines: {stats.get('total_lines', 0):,}")
-        add(f"Errors: {stats.get('errors_count', 0)} | Warnings: {stats.get('warnings_count', 0)}")
+        add(f"\n{c_head}{T['log_stats']}{c_reset}")
+        add(T["total_lines"].format(n=stats.get('total_lines', 0)))
+        add(T["errors_warnings"].format(e=stats.get('errors_count', 0), w=stats.get('warnings_count', 0)))
         if stats.get("timestamps"):
-            add(f"Period: From {stats['timestamps'][0]} to {stats['timestamps'][-1]}")
+            add(T["period"].format(start=stats['timestamps'][0], end=stats['timestamps'][-1]))
 
         if stats.get("suspicious_activity"):
-            add(f"\n{c_head}Detected Security Alerts:{c_reset}")
+            add(f"\n{c_head}{T['detected_alerts']}{c_reset}")
             alerts = [f"{t.replace('_', ' ').title()} ({c})" for t, c in stats["suspicious_activity"].items()]
             add(" | ".join(alerts))
 
@@ -393,33 +573,33 @@ class LogAnalyzer:
 
         left_col, right_col = [], []
 
-        left_col.append(f"{c_sub}HTTP Status Codes:{c_reset}")
+        left_col.append(f"{c_sub}{T['http_status_codes']}{c_reset}")
         if stats.get("http_status_codes"):
             for code, count in stats["http_status_codes"].most_common(5):
                 left_col.append(f"  - Code {code}: {count} times")
             summary = self._group_http_codes(stats["http_status_codes"])
-            left_col.append(f"  {c_sub}Summary by range:{c_reset}")
+            left_col.append(f"  {c_sub}{T['summary_by_range']}{c_reset}")
             for range_code, count in sorted(summary.items()):
                 left_col.append(f"    - {range_code}: {count} requests")
         else:
-            left_col.append("  (No data)")
+            left_col.append(T["no_data"])
 
         if stats.get("top_urls"):
             left_col.append("")
-            left_col.append(f"{c_sub}Top {min(self.top_urls,5)} Requested URLs:{c_reset}")
+            left_col.append(f"{c_sub}{T['top_urls'].format(n=min(self.top_urls,5))}{c_reset}")
             for url, count in stats["top_urls"].most_common(self.top_urls):
                 left_col.append(f"  - ({count}) {self._truncate_text(url, 35)}")
 
         if stats.get("ips"):
-            right_col.append(f"{c_sub}Top {min(self.top_ips,10)} IPs with Geolocation:{c_reset}")
-            right_col.append(f"{'COUNT':<7} {'IP':<18} {'COUNTRY'}")
+            right_col.append(f"{c_sub}{T['top_ips'].format(n=min(self.top_ips,10))}{c_reset}")
+            right_col.append(f"{T['count_hdr']:<7} {T['ip_hdr']:<18} {T['country_hdr']}")
             right_col.append(f"{'-----':<7} {'------------------':<18} {'------'}")
             for ip, count in stats["ips"].most_common(self.top_ips):
                 country = self._get_country_for_ip(ip)
                 right_col.append(f"{count:<7} {ip:<18} {self._truncate_text(country, 15)}")
         if stats.get("user_agents"):
             right_col.append("")
-            right_col.append(f"{c_sub}Top {min(self.top_uas,5)} User-Agents:{c_reset}")
+            right_col.append(f"{c_sub}{T['top_uas'].format(n=min(self.top_uas,5))}{c_reset}")
             for ua, count in stats["user_agents"].most_common(self.top_uas):
                 right_col.append(f"  - ({count}) {self._truncate_text(ua, 35)}")
 
@@ -436,45 +616,44 @@ class LogAnalyzer:
         add = output.append
         c_head, c_sub, c_reset = (("\033[1;34m", "\033[1;36m", "\033[0m") if should_use_color() else ("", "", ""))
 
-        add(f"\n{c_head}=== LOG STATISTICS (LIST VIEW) ==={c_reset}")
-        add(f"Total lines: {stats.get('total_lines', 0):,}")
-        add(f"Errors: {stats.get('errors_count', 0)}")
-        add(f"Warnings: {stats.get('warnings_count', 0)}")
+        add(f"\n{c_head}{T['log_stats_list']}{c_reset}")
+        add(T["total_lines"].format(n=stats.get('total_lines', 0)))
+        add(T["errors_warnings"].format(e=stats.get('errors_count', 0), w=stats.get('warnings_count', 0)))
 
         if stats.get("timestamps"):
-            add(f"\n{c_head}Time Range:{c_reset}")
-            add(f"  From: {stats['timestamps'][0]}")
-            add(f"  To:   {stats['timestamps'][-1]}")
+            add(f"\n{c_head}{T['time_range']}{c_reset}")
+            add(T["from"].format(start=stats['timestamps'][0]))
+            add(T["to"].format(end=stats['timestamps'][-1]))
 
-        add(f"\n{c_head}HTTP Status Codes:{c_reset}")
+        add(f"\n{c_head}{T['http_status_codes']}{c_reset}")
         if stats.get("http_status_codes"):
             for code, count in stats["http_status_codes"].most_common():
                 add(f"  - Code {code}: {count} times")
             summary = self._group_http_codes(stats["http_status_codes"])
-            add(f"\n  {c_sub}Summary by range:{c_reset}")
+            add(f"\n  {c_sub}{T['summary_by_range']}{c_reset}")
             for range_code, count in sorted(summary.items()):
                 add(f"    - {range_code}: {count} requests")
         else:
-            add("  (No data)")
+            add(T["no_data"])
 
         if stats.get("top_urls"):
-            add(f"\n{c_head}Top {self.top_urls} Most Requested URLs:{c_reset}")
+            add(f"\n{c_head}{T['top_urls'].format(n=self.top_urls)}{c_reset}")
             for url, count in stats["top_urls"].most_common(self.top_urls):
                 add(f"  - ({count} times) {self._truncate_text(url)}")
 
         if stats.get("user_agents"):
-            add(f"\n{c_head}Top {self.top_uas} User-Agents:{c_reset}")
+            add(f"\n{c_head}{T['top_uas'].format(n=self.top_uas)}{c_reset}")
             for ua, count in stats["user_agents"].most_common(self.top_uas):
                 add(f"  - ({count} times) {self._truncate_text(ua)}")
 
         if stats.get("suspicious_activity"):
-            add(f"\n{c_head}Detected Security Alerts:{c_reset}")
+            add(f"\n{c_head}{T['detected_alerts']}{c_reset}")
             for t, count in stats["suspicious_activity"].items():
-                add(f"  - Possible {t.replace('_', ' ')} attempts: {count} times")
+                add(T["possible"].format(t=t.replace('_', ' '), c=count))
 
         if stats.get("ips"):
-            add(f"\n{c_head}Top {self.top_ips} IPs with Geolocation:{c_reset}")
-            add(f"{'COUNT':<7} {'IP':<18} {'COUNTRY'}")
+            add(f"\n{c_head}{T['top_ips'].format(n=self.top_ips)}{c_reset}")
+            add(f"{T['count_hdr']:<7} {T['ip_hdr']:<18} {T['country_hdr']}")
             add(f"{'-----':<7} {'------------------':<18} {'------'}")
             for ip, count in stats["ips"].most_common(self.top_ips):
                 country = self._get_country_for_ip(ip)
@@ -493,6 +672,7 @@ class LogAnalyzer:
         return {
             "schema_version": SCHEMA_VERSION,
             "generated_at": datetime.utcnow().isoformat() + "Z",
+            "lang": self.selected_lang,
             "summary": {
                 "file": self.log_file,
                 "total_lines": stats.get("total_lines", 0),
@@ -525,59 +705,47 @@ class LogAnalyzer:
     def _show_json(self, stats):
         print(json.dumps(self._prepare_json(stats), indent=2, ensure_ascii=False))
 
-    # --- Salida segura ---
+    # --- Safe output handling ---
 
     def _ensure_safe_output_path(self, output_file, unsafe_output=False, force=False):
-        """
-        Protege contra usos maliciosos del tipo:
-          --output ../../../../../etc/loquesea  o  --output /etc/loquesea
-
-        Por defecto SOLO permite escribir dentro del cwd (o subdirectorios).
-        Se puede desactivar con --unsafe-output.
-        Evita seguir symlinks simples (comprobación básica).
-        """
         out_path = os.path.abspath(output_file)
         cwd = os.path.abspath(os.getcwd())
 
         if not unsafe_output:
             if not out_path.startswith(cwd + os.sep):
-                raise PermissionError(
-                    f"Refusing to write outside current working directory without --unsafe-output: {output_file}"
-                )
+                raise PermissionError(T["confined_refuse"].format(path=output_file))
 
         parent = os.path.dirname(out_path)
         if not os.path.isdir(parent):
-            raise FileNotFoundError(f"Output directory does not exist: {parent}")
+            raise FileNotFoundError(T["no_dir"].format(path=parent))
 
-        # Evitar symlinks triviales en el fichero a crear
         if os.path.islink(out_path):
-            raise PermissionError(f"Refusing to write to symlink: {output_file}")
+            raise PermissionError(T["symlink_file"].format(path=output_file))
 
-        # Evitar symlinks en el directorio padre (defensa básica)
         parts = parent.split(os.sep)
         check = ""
         for p in parts:
             check = os.path.join(check, p) if check else (p if out_path.startswith(os.sep) else p)
             if os.path.islink(check):
-                raise PermissionError(f"Refusing to write under symlinked directory: {check}")
+                raise PermissionError(T["symlink_dir"].format(path=check))
 
         if os.path.exists(out_path) and not force:
-            raise FileExistsError(f"Output file exists. Use --force to overwrite: {output_file}")
+            raise FileExistsError(T["exists_use_force"].format(path=output_file))
 
         return out_path
 
     def _save_results(self, data, output_file, unsafe_output=False, force=False):
         try:
             safe_path = self._ensure_safe_output_path(output_file, unsafe_output=unsafe_output, force=force)
-            # Al escribir a fichero, ya limpiamos colores si hay
             if isinstance(data, dict) and "matches" in data:
                 if self.json_output:
                     with open(safe_path, "w", encoding="utf-8") as f:
                         json.dump(data, f, indent=2, ensure_ascii=False)
                 else:
                     with open(safe_path, "w", encoding="utf-8") as f:
-                        f.write(f"Pattern search: {data['pattern']}\n")
-                        f.write(f"Total matches: {data['total_found']}\n\n")
+                        print(T["searching_for"].format(pattern=data["pattern"]), file=f)
+                        print(T["showing_matches"].format(shown=len(data["matches"]), total=data["total_found"]), file=f)
+                        print("", file=f)
                         for i, line in enumerate(data["matches"], 1):
                             line_out = ANSI_RE.sub("", line)
                             f.write(f"{i}: {line_out}\n")
@@ -593,82 +761,67 @@ class LogAnalyzer:
                         f.write("\n".join(clean_report))
 
             c_ok, c_reset = ("\033[1;32m", "\033[0m") if should_use_color() else ("", "")
-            print(f"{c_ok}Results saved to: {safe_path}{c_reset}")
+            print(f"{c_ok}{T['results_saved'].format(path=safe_path)}{c_reset}")
         except Exception as e:
-            self._handle_error({"error": f"Saving file: {e}"})
+            self._handle_error({"error": T["saving_file_error"].format(err=e)})
 
+# =========================
+#  CLI & parsing
+# =========================
 
 def parse_date(date_str):
     """
-    Acepta YYYY-MM-DD o 'YYYY-MM-DD HH:MM:SS' y devuelve datetime naïve en UTC *interpretando la entrada como UTC*.
+    Accepts YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS' and returns naive datetime in UTC (interpreting input as UTC).
+    Uses current language for error messages.
     """
     for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S"):
         try:
             dt = datetime.strptime(date_str, fmt)
-            # Interpretamos que el usuario nos da UTC (naïve)
             return dt
         except ValueError:
             continue
-    raise argparse.ArgumentTypeError(f"Invalid date: '{date_str}'. Use YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'")
-
+    raise argparse.ArgumentTypeError(T["invalid_date"].format(date=date_str))
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Advanced log analyzer with safe output, time filtering, and geolocation.",
-        formatter_class=argparse.RawTextHelpFormatter,
-        epilog='''
-Example usage:
-  %(prog)s access.log                                   # Full analysis (columns view)
-  %(prog)s access.log --list-view                       # Full analysis (list view)
-  %(prog)s error.log -p "Timeout" -c 50                 # Search for timeouts
-  %(prog)s app.log --json --output result.json          # JSON output
-  %(prog)s access.log --since 2024-01-01 --until "2024-01-31 23:59:59"  # Time filter
-  zcat access.log.gz | %(prog)s -                       # Read from stdin in a pipeline
+    # Stage 1: bootstrap parser to read --lang early
+    boot = argparse.ArgumentParser(add_help=False)
+    boot.add_argument("--lang", choices=["auto", "en", "es"], default="auto", help=I18N["en"]["arg_lang"])
+    args_boot, _unknown = boot.parse_known_args()
+    lang = choose_lang(args_boot.lang)
+    global T
+    T = I18N[lang]
 
-Security notes:
-  * --output is restricted to current working directory by default.
-  * Use --unsafe-output to allow writing outside CWD (use with care).
-  * Use --force to overwrite existing output files.
-        ''',
+    # Stage 2: full parser with localized texts
+    parser = argparse.ArgumentParser(
+        description=T["description"],
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=T["epilog"],
+        parents=[boot],
     )
-    parser.add_argument("file", help="Log file to analyze (can be .gz or '-' for stdin)")
-    parser.add_argument("-p", "--pattern", help="Specific pattern (regex) to search for")
-    parser.add_argument("-c", "--count", type=positive_int, default=10, help="Number of matched lines to show (pattern search)")
-    parser.add_argument("--json", action="store_true", help="Show output in JSON format")
-    parser.add_argument("--output", help="Output file to save results")
-    parser.add_argument("--force", action="store_true", help="Allow overwriting the output file if it exists")
-    parser.add_argument(
-        "--unsafe-output",
-        action="store_true",
-        help="Allow writing outside the current working directory (DANGEROUS: disables path confinement)",
-    )
-    parser.add_argument(
-        "--list-view",
-        dest="list_view",
-        action="store_true",
-        help="Show results as a list instead of columns",
-    )
-    parser.add_argument(
-        "--since", type=parse_date, help="Filter logs from this UTC date (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS')"
-    )
-    parser.add_argument(
-        "--until", type=parse_date, help="Filter logs up to this UTC date (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS')"
-    )
-    parser.add_argument("--max-ips", type=positive_int, help="Optional limit of unique IPs to track")
-    parser.add_argument("--max-errors", type=positive_int, help="Optional limit of unique errors to track")
-    parser.add_argument("--geoip-db", help="Alternative path to GeoIP database")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging for debugging")
-    parser.add_argument("--no-sanitize-ansi", dest="sanitize_ansi", action="store_false",
-                        help="Do not sanitize ANSI escape codes in output")
-    parser.add_argument("--top-urls", type=positive_int, default=5, help="How many top URLs to display")
-    parser.add_argument("--top-uas", type=positive_int, default=5, help="How many top User-Agents to display")
-    parser.add_argument("--top-ips", type=positive_int, default=20, help="How many top IPs to display")
+    parser.add_argument("file", help=T["arg_file"])
+    parser.add_argument("-p", "--pattern", help=T["arg_pattern"])
+    parser.add_argument("-c", "--count", type=positive_int, default=10, help=T["arg_count"])
+    parser.add_argument("--json", action="store_true", help=T["arg_json"])
+    parser.add_argument("--output", help=T["arg_output"])
+    parser.add_argument("--force", action="store_true", help=T["arg_force"])
+    parser.add_argument("--unsafe-output", action="store_true", help=T["arg_unsafe_output"])
+    parser.add_argument("--list-view", dest="list_view", action="store_true", help=T["arg_list_view"])
+    parser.add_argument("--since", type=parse_date, help=T["arg_since"])
+    parser.add_argument("--until", type=parse_date, help=T["arg_until"])
+    parser.add_argument("--max-ips", type=positive_int, help=T["arg_max_ips"])
+    parser.add_argument("--max-errors", type=positive_int, help=T["arg_max_errors"])
+    parser.add_argument("--geoip-db", help=T["arg_geoip_db"])
+    parser.add_argument("-v", "--verbose", action="store_true", help=T["arg_verbose"])
+    parser.add_argument("--no-sanitize-ansi", dest="sanitize_ansi", action="store_false", help=T["arg_no_sanitize"])
+    parser.add_argument("--top-urls", type=positive_int, default=5, help=T["arg_top_urls"])
+    parser.add_argument("--top-uas", type=positive_int, default=5, help=T["arg_top_uas"])
+    parser.add_argument("--top-ips", type=positive_int, default=20, help=T["arg_top_ips"])
 
     args = parser.parse_args()
 
     if args.file != "-" and not os.path.isfile(args.file):
         c_err, c_reset = ("\033[1;31m", "\033[0m") if should_use_color() else ("", "")
-        msg = f"Error: File '{args.file}' does not exist or is not a regular file."
+        msg = T["bad_file"].format(file=args.file)
         if args.json:
             print(json.dumps({"error": msg}, indent=2, ensure_ascii=False))
         else:
@@ -687,6 +840,7 @@ Security notes:
         top_urls=args.top_urls,
         top_uas=args.top_uas,
         top_ips=args.top_ips,
+        selected_lang=lang,
     )
 
     analyzer.analyze(
@@ -698,7 +852,6 @@ Security notes:
         unsafe_output=args.unsafe_output,
         force=args.force,
     )
-
 
 if __name__ == "__main__":
     main()
