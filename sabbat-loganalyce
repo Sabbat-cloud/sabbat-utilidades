@@ -14,13 +14,14 @@ import os
 from itertools import zip_longest
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
+import signal
 
 # =========================
 #  Config & Internationalization
 # =========================
 
 GEOIP_DB_PATH = "/var/lib/GeoIP/GeoLite2-Country.mmdb"
-SCHEMA_VERSION = "1.3.0"
+SCHEMA_VERSION = "1.3.1"
 
 # Try optional hardened regex engine (enables atomic groups/possessive quantifiers)
 try:
@@ -46,6 +47,7 @@ except ImportError:
     geoip2 = None
 
 ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+SPLIT_RE = re.compile(r"[\s,;'\"()\[\]]+")  # para extraer IPs de forma eficiente
 
 # ---- i18n helpers ----
 def detect_console_lang() -> str:
@@ -273,18 +275,24 @@ def build_safe_compiler(hardened: bool):
         return compiler, PatternT, "re"
 
 def make_suspicious_patterns(compile, engine_name: str):
-    # Bounded alternatives to avoid '.*' catastrophic backtracking.
-    # If using 'regex', we can add atomic groups (?>...) and possessive quantifiers ++ for extra safety.
+    # Bounded patterns
     if engine_name == "regex":
         union_select = compile(r"(?i)\bUNION\b(?>[^\r\n]{0,240}?)\bSELECT\b")
         sqli = compile(r"(?i)(?:--|#|/\*|\bOR\b\s+1=1\b|\bSLEEP\s*\(|\bINFORMATION_SCHEMA\b|\bLOAD_FILE\s*\(|\bXP_CMDSHELL\b)")
+        bool_inj = compile(r"(?i)\b(?:or|and)\b\s+[^\w]?\s*\d+\s*[=><!]{1,2}\s*\d+")
     else:
         union_select = compile(r"(?i)\bUNION\b[^\r\n]{0,240}?\bSELECT\b")
         sqli = compile(r"(?i)(?:--|#|/\*|\bOR\b\s+1=1\b|\bSLEEP\s*\(|\bINFORMATION_SCHEMA\b|\bLOAD_FILE\s*\(|\bXP_CMDSHELL\b)")
-
+        bool_inj = compile(r"(?i)\b(?:or|and)\b\s+\d+\s*[=><!]{1,2}\s*\d+")
     path_traversal = compile(r"(?i)(?:\.\./|%2e%2e/|%2e%2e%2f|\.%2e/|%2e\./)")
     xss = compile(r"(?i)(?:<script\b|javascript:|on\w+=)")
-    return {"sql_union_select": union_select, "sql_ioc": sqli, "path_traversal": path_traversal, "xss_attempt": xss}
+    return {
+        "sql_union_select": union_select,
+        "sql_ioc": sqli,
+        "sql_boolean": bool_inj,
+        "path_traversal": path_traversal,
+        "xss_attempt": xss,
+    }
 
 def make_patterns(compile):
     return {
@@ -375,6 +383,15 @@ class LogAnalyzer:
         self.truncated_lines = 0
         self.bytes_read = 0
 
+        # graceful stop
+        self._stop = False
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _signal_handler(self, signum, frame):
+        self._stop = True
+        self.logger.warning(f"Received signal {signum}, stopping gracefully...")
+
     def _init_logger(self, verbose=False):
         self.logger = logging.getLogger("log_analyzer")
         self.logger.setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -404,27 +421,31 @@ class LogAnalyzer:
         if self.log_file == "-":
             if self.deny_stdin:
                 raise PermissionError("stdin disabled by --deny-stdin")
+            # stdin: no forma fiable de sniff -> confía en self.encoding (o utf-8/auto)
             return sys.stdin
         if self.log_file.endswith(".gz"):
-            # Use surrogateescape to avoid silently dropping bytes
             return gzip.open(self.log_file, "rt", encoding=self._resolve_encoding(), errors="surrogateescape", newline="")
+        # (opcional) otros formatos podrían añadirse aquí (.xz, .zst)
         return open(self.log_file, "r", encoding=self._resolve_encoding(), errors="surrogateescape", newline="")
 
     def _resolve_encoding(self):
         if self.encoding and self.encoding.lower() != "auto":
             return self.encoding
-        # Try utf-8 else latin-1 (lossless)
+
+        if self.log_file == "-":
+            return "utf-8"
+
         try:
             with open(self.log_file, "rb") as f:
-                f.peek(1)
+                sample = f.read(8192)
+            sample.decode("utf-8")
             return "utf-8"
         except Exception:
             return "latin-1"
 
     def extract_valid_ips(self, line):
         valid_ips = []
-        possible_ips = re.split(r"[\s,;'\"()\[\]]+", line)
-        for candidate in possible_ips:
+        for candidate in SPLIT_RE.split(line):
             if not candidate:
                 continue
             try:
@@ -436,6 +457,7 @@ class LogAnalyzer:
         return valid_ips
 
     def analyze(self, pattern=None, count=10, since=None, until=None, output_file=None, unsafe_output=False, force=False):
+        exit_code = 0
         try:
             with self._open_stream() as file_obj:
                 if pattern:
@@ -456,6 +478,9 @@ class LogAnalyzer:
                         self._show_json(stats)
                     else:
                         self._show_text_statistics(stats)
+                    # exit 2 si hay alertas (útil en CI/pipelines)
+                    if sum(stats.get("suspicious_activity", {}).values()) > 0:
+                        exit_code = 2
         except FileNotFoundError:
             self._handle_error({"error": T["file_not_found_json"].format(file=self.log_file)})
         except Exception as e:
@@ -467,6 +492,7 @@ class LogAnalyzer:
                     self.geoip_reader.close()
             except Exception:
                 pass
+        sys.exit(exit_code)
 
     def _handle_error(self, error_msg):
         if self.json_output:
@@ -488,6 +514,8 @@ class LogAnalyzer:
                 raw = iso_match.group(0)
                 if raw.endswith("Z"):
                     raw = raw[:-1] + "+00:00"
+                # Añade ":" al offset si viene como ±HHMM
+                raw = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", raw)
                 raw_clean = re.sub(r"\.\d+", "", raw)
                 dt = datetime.fromisoformat(raw_clean)
                 if dt.tzinfo is not None:
@@ -530,6 +558,8 @@ class LogAnalyzer:
                     if self.sanitize_ansi:
                         line_out = ANSI_RE.sub("", line_out)
                     first_matches.append(line_out)
+            if self._stop:
+                break
         return {
             "schema_version": SCHEMA_VERSION,
             "lang": self.selected_lang,
@@ -541,6 +571,27 @@ class LogAnalyzer:
         }
 
     # ---------- Parallel statistics ----------
+
+    def _merge(self, global_stats, part, first_last):
+        global_stats["ips"].update(part["ips"])
+        global_stats["specific_errors"].update(part["specific_errors"])
+        global_stats["top_urls"].update(part["top_urls"])
+        global_stats["user_agents"].update(part["user_agents"])
+        global_stats["http_methods"].update(part["http_methods"])
+        global_stats["http_status_codes"].update(part["http_status_codes"])
+        global_stats["suspicious_activity"].update(part["suspicious_activity"])
+        global_stats["total_lines"] += part["total_lines"]
+        global_stats["errors_count"] += part["errors_count"]
+        global_stats["warnings_count"] += part["warnings_count"]
+        if part["first_ts"] and first_last["first_ts"] is None:
+            first_last["first_ts"] = part["first_ts"]
+        if part["last_ts"]:
+            first_last["last_ts"] = part["last_ts"]
+
+    def _cap_counter(self, ctr: Counter, maxk: int | None):
+        if maxk is None or len(ctr) <= maxk:
+            return ctr
+        return Counter(dict(ctr.most_common(maxk)))
 
     def _generate_statistics_parallel(self, file_iterable, since=None, until=None):
         # Global structure
@@ -559,8 +610,7 @@ class LogAnalyzer:
             "truncated_lines": 0,
             "bytes_read": 0,
         }
-        first_ts = None
-        last_ts = None
+        first_last = {"first_ts": None, "last_ts": None}
 
         def worker(batch_lines):
             # Produce partial stats
@@ -609,14 +659,13 @@ class LogAnalyzer:
                     method, url, code = hm.groups()
                     part["http_methods"][method] += 1
                     part["http_status_codes"][code] += 1
-                    # Trim URL
                     if len(url) > 400:
                         url = url[:400] + "…"
                     part["top_urls"][url] += 1
                     ul = url.lower()
-                    # Dual-pattern SQLi: union_select or iocs
-                    if self.suspicious_patterns["sql_union_select"].search(ul) or \
-                       self.suspicious_patterns["sql_ioc"].search(ul):
+                    if (self.suspicious_patterns["sql_union_select"].search(ul) or
+                        self.suspicious_patterns["sql_ioc"].search(ul) or
+                        self.suspicious_patterns["sql_boolean"].search(ul)):
                         part["suspicious_activity"]["sql_injection"] += 1
                     if self.suspicious_patterns["path_traversal"].search(ul):
                         part["suspicious_activity"]["path_traversal"] += 1
@@ -632,12 +681,17 @@ class LogAnalyzer:
                     m = self.patterns["user_agent"].search(line)
                     if m:
                         ua = m.group(1).strip()
+                    else:
+                        # fallback: último bloque entrecomillado
+                        qs = list(re.finditer(r'"([^"]*)"', line))
+                        if qs:
+                            ua = qs[-1].group(1).strip()
                 if ua and ua != "-":
                     if len(ua) > 200:
                         ua = ua[:200] + "…"
                     part["user_agents"][ua] += 1
 
-                # timestamps for display only
+                # timestamps para visualización
                 t1 = self.patterns["timestamp_iso"].search(line)
                 t2 = self.patterns["timestamp_apache"].search(line)
                 ts_display = t1.group(0) if t1 else (t2.group(0) if t2 else None)
@@ -646,48 +700,43 @@ class LogAnalyzer:
                         part["first_ts"] = ts_display
                     part["last_ts"] = ts_display
 
+                if self._stop:
+                    break
+
             return part
 
-        # Dispatch batches
+        # Dispatch batches con “inflight” acotado
         futures = []
         batch = []
+        inflight_limit = self.threads * 2
         with ThreadPoolExecutor(max_workers=self.threads) as ex:
             for line in self._iter_lines(file_iterable):
-                if not (since or until):
-                    # no-op for speed
-                    pass
                 batch.append(line)
                 if len(batch) >= self.batch_size:
                     futures.append(ex.submit(worker, batch))
                     batch = []
-            if batch:
+                    if len(futures) >= inflight_limit:
+                        part = futures.pop(0).result()
+                        self._merge(global_stats, part, first_last)
+                if self._stop:
+                    break
+            if batch and not self._stop:
                 futures.append(ex.submit(worker, batch))
 
-            for f in as_completed(futures):
+            for f in futures:
                 part = f.result()
-                # Reduce
-                global_stats["ips"].update(part["ips"])
-                global_stats["specific_errors"].update(part["specific_errors"])
-                global_stats["top_urls"].update(part["top_urls"])
-                global_stats["user_agents"].update(part["user_agents"])
-                global_stats["http_methods"].update(part["http_methods"])
-                global_stats["http_status_codes"].update(part["http_status_codes"])
-                global_stats["suspicious_activity"].update(part["suspicious_activity"])
-                global_stats["total_lines"] += part["total_lines"]
-                global_stats["errors_count"] += part["errors_count"]
-                global_stats["warnings_count"] += part["warnings_count"]
-                if part["first_ts"] and first_ts is None:
-                    first_ts = part["first_ts"]
-                if part["last_ts"]:
-                    last_ts = part["last_ts"]
+                self._merge(global_stats, part, first_last)
 
         # finalize
-        if first_ts:
-            global_stats["timestamps"] = [first_ts, last_ts]
+        if first_last["first_ts"]:
+            global_stats["timestamps"] = [first_last["first_ts"], first_last["last_ts"]]
         global_stats["truncated_lines"] = self.truncated_lines
         global_stats["bytes_read"] = self.bytes_read
 
-        # hint for huge files
+        # Cap global counters (evita explosión de cardinalidad)
+        global_stats["ips"] = self._cap_counter(global_stats["ips"], self.max_ips)
+        global_stats["specific_errors"] = self._cap_counter(global_stats["specific_errors"], self.max_errors)
+
         if (self.max_ips is None and self.max_errors is None and global_stats["total_lines"] > 100_000):
             self.logger.warning(T["large_log_hint"].format(lines=global_stats["total_lines"]))
         return global_stats
@@ -701,9 +750,9 @@ class LogAnalyzer:
           - max_bytes (stop after budget)
         Tracks self.truncated_lines and self.bytes_read.
         """
+        enc = getattr(file_obj, "encoding", "utf-8")
         for raw in file_obj:
-            # Account bytes (approx by encoded length; for stdin we approximate by len(raw))
-            b = len(raw.encode(getattr(file_obj, "encoding", "utf-8"), errors="replace"))
+            b = len(raw.encode(enc, errors="replace"))
             self.bytes_read += b
             if self.max_bytes is not None and self.bytes_read > self.max_bytes:
                 break
@@ -712,6 +761,8 @@ class LogAnalyzer:
                 line = line[: self.max_line_chars] + "…"
                 self.truncated_lines += 1
             yield line
+            if self._stop:
+                break
 
     # ---------- GeoIP ----------
 
@@ -732,7 +783,7 @@ class LogAnalyzer:
         self.geoip_cache.set(ip, country)
         return country
 
-    # ---------- Rendering helpers (unchanged from previous, omitted comments for brevity) ----------
+    # ---------- Rendering helpers ----------
 
     def _group_http_codes(self, http_codes_counter):
         summary = Counter()
@@ -909,29 +960,28 @@ class LogAnalyzer:
     def _show_json(self, stats):
         print(json.dumps(self._prepare_json(stats), indent=2, ensure_ascii=False))
 
-    # --- Safe output handling (unchanged from prior hardened version) ---
+    # --- Safe output handling (hardened) ---
 
     def _ensure_safe_output_path(self, output_file, unsafe_output=False, force=False):
-        out_path = os.path.abspath(output_file)
-        cwd = os.path.abspath(os.getcwd())
+        out_path = os.path.realpath(os.path.abspath(output_file))
+        cwd = os.path.realpath(os.path.abspath(os.getcwd()))
 
         if not unsafe_output:
-            if not out_path.startswith(cwd + os.sep):
+            # Confina la escritura al árbol del cwd (Windows/Linux seguro)
+            try:
+                if os.path.commonpath([cwd, out_path]) != cwd:
+                    raise PermissionError(T["confined_refuse"].format(path=output_file))
+            except ValueError:
+                # En caso de unidades distintas en Windows
                 raise PermissionError(T["confined_refuse"].format(path=output_file))
 
         parent = os.path.dirname(out_path)
         if not os.path.isdir(parent):
             raise FileNotFoundError(T["no_dir"].format(path=parent))
 
-        if os.path.islink(out_path):
+        # Evita escribir directamente en un symlink
+        if os.path.islink(output_file):
             raise PermissionError(T["symlink_file"].format(path=output_file))
-
-        parts = parent.split(os.sep)
-        check = ""
-        for p in parts:
-            check = os.path.join(check, p) if check else (p if out_path.startswith(os.sep) else p)
-            if os.path.islink(check):
-                raise PermissionError(T["symlink_dir"].format(path=check))
 
         if os.path.exists(out_path) and not force:
             raise FileExistsError(T["exists_use_force"].format(path=output_file))
