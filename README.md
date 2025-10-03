@@ -1,6 +1,3 @@
----
-
-## `README.md`
 
 ````markdown
 # 🧰 sabbat-utilidades — CLI toolbox
