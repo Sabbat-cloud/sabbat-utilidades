@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sabbat-utilidades"
+version = "0.3.0"
+description = "CLI toolbox: sabbat-loganalyce & sabbat-fileinspect"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+  { name = "Óscar Giménez Blasco" }
+]
+keywords = ["cli", "logs", "security", "forensics", "sysadmin", "devops", "sre"]
+
+# Dependencias base (mantener mínimas)
+dependencies = [
+  # Nada obligatorio para funcionar en modo básico
+]
+
+# Extras opcionales
+[project.optional-dependencies]
+geoip = ["geoip2>=4.6.0"]
+images = ["Pillow>=10.0.0"]
+detect = [
+  "chardet>=5.1.0",
+  # Uno de estos dos puede servirte para MIME; lo hacemos opcional
+  "python-magic>=0.4.27; platform_system != 'Windows'",
+  "python-magic-bin>=0.4.14; platform_system == 'Windows'"
+]
+hardened = ["regex>=2024.5.15", "re2>=0.3.3"]
+
+# Entry points (expondrán los comandos en PATH)
+[project.scripts]
+sabbat-loganalyce = "sabbat_utils.loganalyce:cli_main"
+sabbat-fileinspect = "sabbat_utils.fileinspect:cli_main"
+
+[project.urls]
+Homepage = "https://github.com/sabbat-cloud/sabbat-utilidades"
+Issues = "https://github.com/sabbat-cloud/sabbat-utilidades/issues"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sabbat_utils*"]
+
+# Opcional: Ruff (lint rápido)
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+extend-select = ["I"]  # isort
