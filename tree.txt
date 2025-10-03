@@ -1,0 +1,9 @@
+sabbat-utilidades/
+├─ sabbat_utils/
+│  ├─ __init__.py
+│  ├─ loganalyce.py     
+│  └─ fileinspect.py     
+├─ README.md
+├─ CHANGELOG.md
+├─ pyproject.toml
+└─ LICENSE
