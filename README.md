@@ -1,11 +1,11 @@
 ````markdown
-# 📊 sabbat-analizalogs — Advanced Log Analyzer / Analizador Avanzado de Logs
+# 📊 sabbat-loganalyce — Advanced Log Analyzer / Analizador Avanzado de Logs
 
-> *“Your logs have a story to tell. sabbat-analizalogs deciphers it for you.”*  
-> *“Tus logs tienen una historia que contar. sabbat-analizalogs la descifra por ti.”*
+> *“Your logs have a story to tell. sabbat-loganalyce deciphers it for you.”*  
+> *“Tus logs tienen una historia que contar. sabbat-loganalyce la descifra por ti.”*
 
-`sabbat-analizalogs` is a production-ready Python 3 log analyzer. It reads standard or compressed logs (`.gz`), supports `stdin`, and outputs rich statistics, security signals, and JSON reports.  
-`sabbat-analizalogs` es un analizador de logs en Python 3 listo para producción. Lee logs estándar o comprimidos (`.gz`), admite `stdin` y genera estadísticas útiles, señales de seguridad y reportes JSON.
+`sabbat-loganalyce` is a production-ready Python 3 log analyzer. It reads standard or compressed logs (`.gz`), supports `stdin`, and outputs rich statistics, security signals, and JSON reports.  
+`sabbat-loganalyce` es un analizador de logs en Python 3 listo para producción. Lee logs estándar o comprimidos (`.gz`), admite `stdin` y genera estadísticas útiles, señales de seguridad y reportes JSON.
 
 ---
 
@@ -71,8 +71,8 @@ pip install -r requirements.txt
 pip install .
 ```
 
-If installed with `pip install .`, the CLI `sabbat-analizalogs` is available on PATH.
-Si instalas con `pip install .`, tendrás el CLI `sabbat-analizalogs` en tu PATH.
+If installed with `pip install .`, the CLI `sabbat-loganalyce` is available on PATH.
+Si instalas con `pip install .`, tendrás el CLI `sabbat-loganalyce` en tu PATH.
 
 ---
 
@@ -80,25 +80,25 @@ Si instalas con `pip install .`, tendrás el CLI `sabbat-analizalogs` en tu PATH
 
 ```bash
 # Full analysis (columns) / Análisis completo (columnas)
-sabbat-analizalogs access.log
+sabbat-loganalyce access.log
 
 # List view / Vista lista
-sabbat-analizalogs access.log --list-view
+sabbat-loganalyce access.log --list-view
 
 # Pattern search (first 50) / Búsqueda de patrón (primeras 50)
-sabbat-analizalogs error.log -p "Timeout|Exception" -c 50
+sabbat-loganalyce error.log -p "Timeout|Exception" -c 50
 
 # JSON output / Salida JSON
-sabbat-analizalogs app.log --json
+sabbat-loganalyce app.log --json
 
 # Save JSON (confined to CWD) / Guardar JSON (confinado al CWD)
-sabbat-analizalogs app.log --json --output reports/result.json
+sabbat-loganalyce app.log --json --output reports/result.json
 
 # Time filter (UTC) / Filtro temporal (UTC)
-sabbat-analizalogs access.log --since 2024-01-01 --until "2024-01-31 23:59:59"
+sabbat-loganalyce access.log --since 2024-01-01 --until "2024-01-31 23:59:59"
 
 # Pipeline (stdin) / Pipeline (stdin)
-zcat access.log.gz | sabbat-analizalogs - --json
+zcat access.log.gz | sabbat-loganalyce - --json
 ```
 
 ---
@@ -153,24 +153,24 @@ zcat access.log.gz | sabbat-analizalogs - --json
 ```bash
 # 1) Multi-threaded analysis (auto CPU), hardened regex, recommended caps
 #    Análisis multihilo (auto CPU), regex endurecida y topes recomendados
-sabbat-analizalogs access.log \
+sabbat-loganalyce access.log \
   --threads 8 --batch-size 5000 --hardened-regex \
   --max-line-chars 4096 --max-bytes 500000000 \
   --top-urls 10 --top-uas 10 --top-ips 50
 
 # 2) Ordered, single-thread pattern search in safe mode
 #    Búsqueda de patrón (ordenada, monohilo) en modo seguro
-sabbat-analizalogs error.log -p "timeout|exception" -c 50 --lang es
+sabbat-loganalyce error.log -p "timeout|exception" -c 50 --lang es
 
 # 3) JSON output + confinement (within CWD)
 #    Salida JSON + confinamiento (dentro de CWD)
-sabbat-analizalogs app.log --json --output reports/result.json
+sabbat-loganalyce app.log --json --output reports/result.json
 ```
 
 Additional stress ideas / Ideas de estrés:
 
 * Huge `.gz` via pipeline (if policy allows) / `.gz` gigante por pipeline (si la política lo permite):
-  `zcat huge.log.gz | sabbat-analizalogs - --json --max-line-chars 4096 --max-bytes 200000000`
+  `zcat huge.log.gz | sabbat-loganalyce - --json --max-line-chars 4096 --max-bytes 200000000`
 * ReDoS probes / Sondeos ReDoS: include long UNION…SELECT lines with noise and ensure no CPU spikes.
   Incluir líneas largas con UNION…SELECT + ruido y verificar que no sube la CPU.
 
