@@ -313,4 +313,3 @@ All dates in UTC.
 Este changelog sigue un formato libre inspirado en *Keep a Changelog* y versiones semánticas por comando.
 ````
 
----
